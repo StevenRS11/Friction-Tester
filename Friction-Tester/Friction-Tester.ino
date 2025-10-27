@@ -1,15 +1,11 @@
 /*
-  ESP32 Paddle COF Tester (DIR/STEP swapped)
-  - DRV8825 stepper (DIR/STEP/EN)
-  - HX711 load cell amp for tangential (friction) force
-  - SSD1306 128x64 OLED (I2C)
-  - Two buttons: START, ZERO/CAL (short press = tare; long press = 3 lb calibration)
-  - Limit switch for homing zero inches
-  - Travel: 19 full revolutions = 6.0 inches
-    * Ignore first 2.5" (lowering)
-    * Ignore next 0.5" (noise)
-    * Measure last 3.0"
-  - COF = (avg friction force) / (3.0 lb normal force)
+  ESP32 Paddle COF Tester (continuous bidirectional test)
+  - DRV8825 + NEMA17
+  - HX711 load cell amp
+  - SSD1306 OLED (I2C)
+  - Buttons: START (GPIO18), ZERO/CAL (GPIO19) -> INPUT_PULLUP, wire to GND
+  - Limit switch: GPIO32 -> INPUT_PULLUP, active-LOW, wire to GND
+  - On normal boot: homes to limit switch automatically if not already pressed
 */
 
 #include <Arduino.h>
@@ -20,69 +16,51 @@
 #include <Preferences.h>
 
 // ----------------------------- USER CONFIG ----------------------------------
-// I2C pins (OLED)
 #define I2C_SDA 22
 #define I2C_SCL 23
 
-// OLED
 #define OLED_WIDTH   128
 #define OLED_HEIGHT  64
 #define OLED_ADDR    0x3C
 
-// HX711 pins
 #define HX_DOUT  33
 #define HX_SCK   25
 
-// DRV8825 pins (STEP and DIR swapped)
 #define PIN_STEP  17
 #define PIN_DIR   16
-#define PIN_EN    27   // Active LOW (LOW = enabled)
+#define PIN_EN    27   // Active LOW
 
-// Limit switch
 #define PIN_LIMIT  32
-#define LIMIT_ACTIVE_LOW 1 // 1 if switch pulls pin LOW when triggered
+#define LIMIT_ACTIVE_LOW 1
 
-// Buttons
-#define BTN_START   34
-#define BTN_ZERO    35
+#define BTN_START   18
+#define BTN_ZERO    19
 
-// Stepper configuration
-const int   FULL_STEPS_PER_REV = 200;     // 1.8° motor
-const float MICROSTEP            = 16.0;  // DRV8825 microstep setting
-const float REVS_TOTAL          = 19.0;   // 19 full revs = 6 inches
+const int   FULL_STEPS_PER_REV = 200;
+const float MICROSTEP           = 16.0;
+const float REVS_TOTAL          = 19.0;
 const float INCHES_TOTAL        = 6.0;
 const float REVS_PER_INCH       = REVS_TOTAL / INCHES_TOTAL;
 const float STEPS_PER_REV       = FULL_STEPS_PER_REV * MICROSTEP;
 const float STEPS_PER_INCH      = STEPS_PER_REV * REVS_PER_INCH;
 
-// Segment lengths (inches)
 const float SEG_LOWER_IN   = 2.5;
 const float SEG_NOISE_IN   = 0.5;
 const float SEG_MEASURE_IN = 3.0;
 
-// Motion parameters
 const int    STEP_PULSE_US   = 600;
-const int    HOME_STEP_US    = 1000;
+const int    HOME_STEP_US    = 600;
 const int    BACKOFF_STEPS   = 800;
 const bool   DIR_FORWARD     = true;
 const bool   DIR_HOME_TOWARD_LIMIT = !DIR_FORWARD;
 
-// Buttons timing
 const uint32_t DEBOUNCE_MS   = 30;
 const uint32_t LONG_PRESS_MS = 1200;
 
-// Known normal force
 const float NORMAL_FORCE_LB  = 3.0;
-
-// HX711 averaging
 const int HX_SAMPLES_TARE    = 20;
 const int HX_SAMPLES_MEAS    = 5;
 // ----------------------------------------------------------------------------
-
-struct RunResult {
-  float avgFrictionLb;
-  float cof;
-};
 
 Adafruit_SSD1306 oled(OLED_WIDTH, OLED_HEIGHT, &Wire);
 HX711 scale;
@@ -105,6 +83,17 @@ struct Btn {
 Btn btnStart{BTN_START, true, 0, 0, false};
 Btn btnZero {BTN_ZERO,  true, 0, 0, false};
 
+struct RunResult {
+  float avgFrictionLb;
+  float cof;
+};
+
+// Forward-declare measurement struct/function so Arduino's preprocessor can't
+// reorder things in a way that breaks the type resolution.
+struct MeasureResult { double avgLb; long count; };
+MeasureResult measureDuringMove(long steps, bool forward, int pulseUs);
+
+// ----------------------------- Utils ----------------------------------------
 void stepperEnable(bool on) { digitalWrite(PIN_EN, on ? LOW : HIGH); }
 void setDir(bool forward)   { digitalWrite(PIN_DIR, forward ? HIGH : LOW); }
 
@@ -144,12 +133,10 @@ void showSplash() {
   oled.setCursor(0, 0);
   oled.println(F("ESP32 Paddle COF Tester"));
   oled.println(F("DRV8825 + HX711 + OLED"));
-  oled.println();
-  oled.println(F("BTN Start: Run Test"));
-  oled.println(F("BTN Zero : Tare/Cal"));
   oled.display();
 }
 
+// --------------------- Load cell calibration & I/O ---------------------------
 void saveCalibration() {
   prefs.begin(PREFS_NAMESPACE, false);
   prefs.putFloat(KEY_CAL, g_calibration);
@@ -220,6 +207,7 @@ void doCalibration3lb() {
   delay(1500);
 }
 
+// ----------------------------- Motion ---------------------------------------
 void homeToLimit() {
   stepperEnable(true);
   setDir(DIR_HOME_TOWARD_LIMIT);
@@ -227,11 +215,13 @@ void homeToLimit() {
   while (!limitHit()) doStepBlocking(HOME_STEP_US);
 
   setDir(!DIR_HOME_TOWARD_LIMIT);
-  for (int i=0; i<800; i++) doStepBlocking(HOME_STEP_US);
+  for (int i=0; i<BACKOFF_STEPS; i++) doStepBlocking(HOME_STEP_US);
   setDir(DIR_HOME_TOWARD_LIMIT);
   while (!limitHit()) doStepBlocking(HOME_STEP_US);
   setDir(!DIR_HOME_TOWARD_LIMIT);
-  for (int i=0; i<400; i++) doStepBlocking(HOME_STEP_US);
+  for (int i=0; i<BACKOFF_STEPS/2; i++) doStepBlocking(HOME_STEP_US);
+
+  stepperEnable(false);
 }
 
 void moveStepsBlocking(long steps, bool forward, int pulseUs) {
@@ -239,53 +229,67 @@ void moveStepsBlocking(long steps, bool forward, int pulseUs) {
   for (long i=0; i<steps; i++) doStepBlocking(pulseUs);
 }
 
-
-
-RunResult runTest() {
-  long steps_lower   = lround(SEG_LOWER_IN   * STEPS_PER_INCH);
-  long steps_noise   = lround(SEG_NOISE_IN   * STEPS_PER_INCH);
-  long steps_measure = lround(SEG_MEASURE_IN * STEPS_PER_INCH);
-
-  oledHeader("Homing...");
-  oled.display();
-  homeToLimit();
-
-  oledHeader("Running Test...");
-  oled.println(F("Lowering..."));
-  oled.display();
-  stepperEnable(true);
-  moveStepsBlocking(steps_lower, DIR_FORWARD, STEP_PULSE_US);
-
-  oledHeader("Running Test...");
-  oled.println(F("Noise zone..."));
-  oled.display();
-  moveStepsBlocking(steps_noise, DIR_FORWARD, STEP_PULSE_US);
-
-  oledHeader("Running Test...");
-  oled.println(F("Measuring..."));
-  oled.display();
-
+MeasureResult measureDuringMove(long steps, bool forward, int pulseUs) {
+  setDir(forward);
   double sumF = 0.0;
   long nF = 0;
-  for (long i=0; i<steps_measure; i++) {
-    doStepBlocking(STEP_PULSE_US);
+  for (long i = 0; i < steps; i++) {
+    doStepBlocking(pulseUs);
     long raw = hxReadRawAvg(HX_SAMPLES_MEAS);
     float lbs = rawToPounds(raw);
     sumF += lbs;
     nF++;
   }
+  MeasureResult mr;
+  mr.avgLb = (nF > 0) ? (sumF / (double)nF) : 0.0;
+  mr.count = nF;
+  return mr;
+}
+
+RunResult runTest() {
+  const long steps_lower   = lround(SEG_LOWER_IN   * STEPS_PER_INCH);
+  const long steps_noise   = lround(SEG_NOISE_IN   * STEPS_PER_INCH);
+  const long steps_measure = lround(SEG_MEASURE_IN * STEPS_PER_INCH);
+
+  oledHeader("Homing...");
+  oled.display();
+  homeToLimit();
+
+  oledHeader("Running (forward)...");
+  oled.println(F("Lowering..."));
+  oled.display();
+
+  stepperEnable(true);
+  moveStepsBlocking(steps_lower,  DIR_FORWARD, STEP_PULSE_US);
+  moveStepsBlocking(steps_noise,  DIR_FORWARD, STEP_PULSE_US);
+
+  oledHeader("Measuring (FWD)...");
+  oled.display();
+  MeasureResult fwd = measureDuringMove(steps_measure, DIR_FORWARD, STEP_PULSE_US);
+
+  const int END_PAUSE_MS = 600;
+  delay(END_PAUSE_MS);
+
+  oledHeader("Measuring (REV)...");
+  oled.display();
+  MeasureResult rev = measureDuringMove(steps_measure, !DIR_FORWARD, STEP_PULSE_US);
 
   oledHeader("Returning...");
   oled.display();
-  moveStepsBlocking(steps_lower + steps_noise + steps_measure, !DIR_FORWARD, STEP_PULSE_US);
+  moveStepsBlocking(steps_noise,  !DIR_FORWARD, STEP_PULSE_US);
+  moveStepsBlocking(steps_lower,  !DIR_FORWARD, STEP_PULSE_US);
+
+  homeToLimit();
   stepperEnable(false);
 
+  double avgLbTwoPass = 0.5 * (fabs(fwd.avgLb) + fabs(rev.avgLb));
   RunResult rr{};
-  rr.avgFrictionLb = (nF > 0) ? sumF / nF : 0;
-  rr.cof = fabs(rr.avgFrictionLb) / NORMAL_FORCE_LB;
+  rr.avgFrictionLb = (float)avgLbTwoPass;
+  rr.cof = (float)(avgLbTwoPass / NORMAL_FORCE_LB);
   return rr;
 }
 
+// ----------------------------- Buttons --------------------------------------
 bool readButton(Btn& b, bool& shortPress, bool& longPress) {
   shortPress = false;
   longPress  = false;
@@ -312,26 +316,45 @@ bool readButton(Btn& b, bool& shortPress, bool& longPress) {
   return (shortPress || longPress);
 }
 
+// ----------------------------- Setup / Loop ---------------------------------
 void setup() {
   pinMode(PIN_STEP, OUTPUT);
   pinMode(PIN_DIR, OUTPUT);
   pinMode(PIN_EN, OUTPUT);
-  pinMode(PIN_LIMIT, INPUT);
+  pinMode(PIN_LIMIT, INPUT_PULLUP);
   pinMode(BTN_START, INPUT_PULLUP);
   pinMode(BTN_ZERO,  INPUT_PULLUP);
 
   stepperEnable(false);
-
   Wire.begin(I2C_SDA, I2C_SCL);
   oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
   oled.clearDisplay();
   oled.display();
 
-  //scale.begin(HX_DOUT, HX_SCK);
+  scale.begin(HX_DOUT, HX_SCK);
   loadCalibration();
 
   showSplash();
-  delay(1200);
+  delay(500);
+
+  oledHeader("Initializing...");
+  oled.println(F("Checking limit..."));
+  oled.display();
+
+  if (!limitHit()) {
+    oled.println(F("Homing..."));
+    oled.display();
+    homeToLimit();
+    oled.println(F("Homed"));
+    oled.display();
+    delay(400);
+  } else {
+    oled.println(F("Already at home"));
+    oled.display();
+    delay(400);
+  }
+
+  stepperEnable(false);
 }
 
 void loop() {
@@ -356,7 +379,7 @@ void loop() {
     oledHeader("Tare Done");
     oledKV("TareRaw", String(g_tareRaw));
     oled.display();
-    delay(800);
+    delay(600);
     return;
   }
 
@@ -371,7 +394,7 @@ void loop() {
     oledKV("Avg F (lb)", String(r.avgFrictionLb, 3));
     oledKV("COF", String(r.cof, 3));
     oled.display();
-    delay(5000);
+    delay(4000);
     return;
   }
 }
