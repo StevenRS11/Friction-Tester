@@ -14,6 +14,7 @@
 #include <Adafruit_SSD1306.h>
 #include <HX711.h>
 #include <Preferences.h>
+#include <math.h>
 
 // ----------------------------- USER CONFIG ----------------------------------
 #define I2C_SDA 22
@@ -57,18 +58,16 @@ const bool   DIR_HOME_TOWARD_LIMIT = !DIR_FORWARD;
 const uint32_t DEBOUNCE_MS   = 30;
 const uint32_t LONG_PRESS_MS = 1200;
 
-const float NORMAL_FORCE_LB  = 2.784; // known normal force
-const float CAL_FORCE_LB  = 3.085; // known normal force
-
-const int HX_SAMPLES_TARE    = 20;  // averaging for tare
-const int HX_SAMPLES_MEAS    = 5;   // UNUSED in non-blocking path (kept for compat)
+const float CAL_WEIGHT_LB    = 3.085;   // calibration weight
+const float NORMAL_FORCE_LB  = 2.7842;  // test normal force
+const int HX_SAMPLES_TARE    = 20;      // averaging for tare
+const int HX_SAMPLES_MEAS    = 5;       // (unused by non-blocking read)
 // ----------------------------------------------------------------------------
 
 Adafruit_SSD1306 oled(OLED_WIDTH, OLED_HEIGHT, &Wire);
 HX711 scale;
 Preferences prefs;
 
-// Persist last measurement for display on Idle
 bool  g_hasResult = false;
 float g_lastAvgLb = 0.0f;
 float g_lastCOF   = 0.0f;
@@ -77,7 +76,7 @@ const char* PREFS_NAMESPACE = "cof";
 const char* KEY_CAL         = "calib";
 const char* KEY_TARE        = "tare";
 
-float g_calibration = 1000.0f; // raw-to-lbs divisor
+float g_calibration = 1000.0f; // counts per lb
 long  g_tareRaw     = 0;       // tare offset (raw counts)
 
 struct Btn {
@@ -90,11 +89,10 @@ struct Btn {
 Btn btnStart{BTN_START, true, 0, 0, false};
 Btn btnZero {BTN_ZERO,  true, 0, 0, false};
 
-// Results structs defined EARLY to avoid Arduino reordering issues
 struct RunResult { float avgFrictionLb; float cof; };
 struct MeasureResult { double avgLb; long count; };
 
-// Forward declarations for any cross-references
+// Prototypes
 void   stepperEnable(bool on);
 void   setDir(bool forward);
 void   doStepBlocking(int pulseUs);
@@ -113,6 +111,7 @@ void   moveStepsBlocking(long steps, bool forward, int pulseUs);
 MeasureResult measureDuringMove(long steps, bool forward, int pulseUs);
 RunResult runTest();
 bool   readButton(Btn& b, bool& shortPress, bool& longPress);
+void   updateLiveForceLine(bool forceClear=false);
 
 // ----------------------------- Utils ----------------------------------------
 void stepperEnable(bool on) { digitalWrite(PIN_EN, on ? LOW : HIGH); }
@@ -157,7 +156,6 @@ void showSplash() {
   oled.display();
 }
 
-// --------------------- Load cell calibration & I/O ---------------------------
 void saveCalibration() {
   prefs.begin(PREFS_NAMESPACE, false);
   prefs.putFloat(KEY_CAL, g_calibration);
@@ -221,9 +219,8 @@ void doCalibration3lb() {
     return;
   }
 
-  // Calibration math: counts-per-pound = delta / 3.0
-  // We store g_calibration as counts per lb so lbs = (raw - tare)/g_calibration
-  g_calibration = (float)delta / CAL_FORCE_LB;
+  // counts per lb
+  g_calibration = (float)delta / CAL_WEIGHT_LB;
   saveCalibration();
 
   oledHeader("CAL DONE");
@@ -232,11 +229,13 @@ void doCalibration3lb() {
   oledKV("TareRaw", String(g_tareRaw));
   oled.display();
   delay(1500);
-
-
 }
+
 // ----------------------------- Motion ---------------------------------------
+bool g_motionActive = false; // used to suppress OLED live updates during motion
+
 void homeToLimit() {
+  g_motionActive = true;
   stepperEnable(true);
   setDir(DIR_HOME_TOWARD_LIMIT);
   while (!limitHit()) doStepBlocking(HOME_STEP_US);
@@ -249,6 +248,7 @@ void homeToLimit() {
   for (int i=0; i<BACKOFF_STEPS/2; i++) doStepBlocking(HOME_STEP_US);
 
   stepperEnable(false);
+  g_motionActive = false;
 }
 
 void moveStepsBlocking(long steps, bool forward, int pulseUs) {
@@ -289,6 +289,7 @@ RunResult runTest() {
   oled.println(F("Lowering..."));
   oled.display();
 
+  g_motionActive = true;
   stepperEnable(true);
   moveStepsBlocking(steps_lower,  DIR_FORWARD, STEP_PULSE_US); // ignore
   moveStepsBlocking(steps_noise,  DIR_FORWARD, STEP_PULSE_US); // ignore
@@ -311,10 +312,13 @@ RunResult runTest() {
 
   homeToLimit();
   stepperEnable(false);
+  g_motionActive = false;
 
+  // Sample-weighted average of magnitudes across the two passes
   double weightedSum = fabs(fwd.avgLb) * (double)fwd.count + fabs(rev.avgLb) * (double)rev.count;
-  long   totalCount = fwd.count + rev.count;
+  long   totalCount  = fwd.count + rev.count;
   double avgLbTwoPass = (totalCount > 0) ? (weightedSum / (double)totalCount) : 0.0;
+
   RunResult rr{};
   rr.avgFrictionLb = (float)avgLbTwoPass;
   rr.cof = (float)(avgLbTwoPass / NORMAL_FORCE_LB);
@@ -339,6 +343,30 @@ bool readButton(Btn& b, bool& shortPress, bool& longPress) {
   }
   if (b.last == LOW && !b.longSent && (now - b.downAt) >= LONG_PRESS_MS) { longPress = true; b.longSent = true; }
   return (shortPress || longPress);
+}
+
+// ----------------------------- Live Force Overlay ---------------------------
+unsigned long g_lastForceDrawMs = 0;
+void updateLiveForceLine(bool forceClear) {
+  if (g_motionActive) return; // avoid OLED writes during motion
+  if (!scale.is_ready()) return;
+
+  unsigned long now = millis();
+  if (!forceClear && (now - g_lastForceDrawMs) < 1000) return; // 1 Hz
+  g_lastForceDrawMs = now;
+
+  long raw = scale.read();
+  float lbs = rawToPounds(raw);
+
+  // Draw a single-line overlay at the bottom without clearing the whole screen
+  // Clear the bottom 10px band
+  oled.fillRect(0, OLED_HEIGHT-12, OLED_WIDTH, 12, SSD1306_BLACK);
+  oled.setCursor(0, OLED_HEIGHT-10);
+  oled.setTextSize(1);
+  oled.setTextColor(SSD1306_WHITE);
+  oled.print(F("Force (lb): "));
+  oled.println(String(lbs, 3));
+  oled.display();
 }
 
 // ----------------------------- Setup / Loop ---------------------------------
@@ -385,6 +413,7 @@ void setup() {
 }
 
 void loop() {
+  // Idle screen
   oledHeader("Idle");
   oledKV("Cal", String(g_calibration, 2));
   oledKV("TareRaw", String(g_tareRaw));
@@ -395,48 +424,53 @@ void loop() {
   oled.println(F("Start=Run | Zero=Tar/Cal"));
   oled.display();
 
-  bool sp=false, lp=false, sz=false, lz=false;
+  // keep updating live force once per second while idle
+  g_motionActive = false;
   while (true) {
+    bool sp=false, lp=false, sz=false, lz=false;
     readButton(btnStart, sp, lp);
     readButton(btnZero,  sz, lz);
-    if (sp || lp || sz || lz) break;
-    delay(10);
-  }
+    if (sp || lp || sz || lz) {
+      updateLiveForceLine(true); // clear the overlay line before changing screen
+      if (sz) {
+        oledHeader("Taring..."); oled.display();
+        tareNow();
+        oledHeader("Tare Done");
+        oledKV("TareRaw", String(g_tareRaw));
+        if (g_hasResult) { oledKV("Last COF", String(g_lastCOF, 3)); }
+        oled.display();
+        delay(600);
+        break; // return to idle refresh loop
+      }
+      if (lz) {
+        doCalibration3lb();
+        break; // return to idle
+      }
+      if (sp) {
+        RunResult r = runTest();
+        g_lastAvgLb = r.avgFrictionLb;
+        g_lastCOF   = r.cof;
+        g_hasResult = true;
 
-  if (sz) {
-    oledHeader("Taring...");
-    oled.display();
-    tareNow();
-    oledHeader("Tare Done");
-    oledKV("TareRaw", String(g_tareRaw));
-    if (g_hasResult) { oledKV("Last COF", String(g_lastCOF, 3)); }
-    oled.display();
-    delay(600);
-    return;
-  }
+        oledHeader("Result");
+        oledKV("Avg F (lb)", String(r.avgFrictionLb, 3));
+        oledKV("COF", String(r.cof, 3));
+        oled.println(F("Press START to test again"));
+        oled.display();
 
-  if (lz) { doCalibration3lb(); return; }
-
-  if (sp) {
-    RunResult r = runTest();
-    g_lastAvgLb = r.avgFrictionLb;
-    g_lastCOF   = r.cof;
-    g_hasResult = true;
-
-    oledHeader("Result");
-    oledKV("Avg F (lb)", String(r.avgFrictionLb, 3));
-    oledKV("COF", String(r.cof, 3));
-    oled.println(F("Press START to test again"));
-    oled.display();
-
-    // Wait here showing the result until user decides next action
-    while (true) {
-      bool a=false,b=false,c=false,d=false;
-      readButton(btnStart, a, b);
-      readButton(btnZero,  c, d);
-      if (a || b || c || d) break;
-      delay(10);
+        // Wait here showing the result until any button input
+        while (true) {
+          bool a=false,b=false,c=false,d=false;
+          readButton(btnStart, a, b);
+          readButton(btnZero,  c, d);
+          if (a || b || c || d) break;
+          updateLiveForceLine();
+          delay(10);
+        }
+        break; // back to idle
+      }
     }
-    return;
+    updateLiveForceLine();
+    delay(10);
   }
 }
