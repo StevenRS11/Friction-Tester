@@ -66,6 +66,11 @@ Adafruit_SSD1306 oled(OLED_WIDTH, OLED_HEIGHT, &Wire);
 HX711 scale;
 Preferences prefs;
 
+// Persist last measurement for display on Idle
+bool  g_hasResult = false;
+float g_lastAvgLb = 0.0f;
+float g_lastCOF   = 0.0f;
+
 const char* PREFS_NAMESPACE = "cof";
 const char* KEY_CAL         = "calib";
 const char* KEY_TARE        = "tare";
@@ -181,41 +186,53 @@ float rawToPounds(long raw) { return (float)(raw - g_tareRaw) / g_calibration; }
 void tareNow() { g_tareRaw = hxReadRawAvg(HX_SAMPLES_TARE); saveCalibration(); }
 
 void doCalibration3lb() {
-  oledHeader("Calibration (3 lb)");
-  oled.println(F("1) Remove load"));
-  oled.println(F("2) Press START to tare"));
+  // ---- Step 1: Tare (zero-load) ----
+  oledHeader("CAL: Step 1/2 (Tare)");
+  oled.println(F("Remove all load"));
+  oled.println(F("Press START to tare"));
   oled.display();
 
   while (digitalRead(BTN_START) == HIGH) delay(5);
-  while (digitalRead(BTN_START) == LOW) delay(5);
+  while (digitalRead(BTN_START) == LOW)  delay(5);
+
+  oledHeader("CAL: Taring...");
+  oled.display();
   g_tareRaw = hxReadRawAvg(HX_SAMPLES_TARE);
 
-  oledHeader("Calibration (3 lb)");
-  oled.println(F("Place 3 lb weight"));
-  oled.println(F("Press START to confirm"));
+  // ---- Step 2: Known weight ----
+  oledHeader("CAL: Step 2/2 (3 lb)");
+  oled.println(F("Place 3.00 lb weight"));
+  oled.println(F("Press START to sample"));
   oled.display();
 
   while (digitalRead(BTN_START) == HIGH) delay(5);
-  while (digitalRead(BTN_START) == LOW) delay(5);
+  while (digitalRead(BTN_START) == LOW)  delay(5);
 
   long raw3 = hxReadRawAvg(HX_SAMPLES_TARE);
-  long delta = raw3 - g_tareRaw;
+  long delta = raw3 - g_tareRaw; // counts due to 3 lb
+
   if (abs(delta) < 100) {
-    oledHeader("Calibration FAILED");
+    oledHeader("CAL FAILED");
+    oled.println(F("Signal too small"));
     oled.display();
     delay(2000);
     return;
   }
+
+  // Calibration math: counts-per-pound = delta / 3.0
+  // We store g_calibration as counts per lb so lbs = (raw - tare)/g_calibration
   g_calibration = (float)delta / NORMAL_FORCE_LB;
   saveCalibration();
 
-  oledHeader("Calibration DONE");
-  oledKV("Cal", String(g_calibration, 2));
+  oledHeader("CAL DONE");
+  oledKV("Counts@3lb", String(delta));
+  oledKV("Cal (cnt/lb)", String(g_calibration, 2));
   oledKV("TareRaw", String(g_tareRaw));
   oled.display();
   delay(1500);
-}
 
+
+}
 // ----------------------------- Motion ---------------------------------------
 void homeToLimit() {
   stepperEnable(true);
@@ -293,7 +310,9 @@ RunResult runTest() {
   homeToLimit();
   stepperEnable(false);
 
-  double avgLbTwoPass = 0.5 * (fabs(fwd.avgLb) + fabs(rev.avgLb));
+  double weightedSum = fabs(fwd.avgLb) * (double)fwd.count + fabs(rev.avgLb) * (double)rev.count;
+  long   totalCount = fwd.count + rev.count;
+  double avgLbTwoPass = (totalCount > 0) ? (weightedSum / (double)totalCount) : 0.0;
   RunResult rr{};
   rr.avgFrictionLb = (float)avgLbTwoPass;
   rr.cof = (float)(avgLbTwoPass / NORMAL_FORCE_LB);
@@ -367,6 +386,10 @@ void loop() {
   oledHeader("Idle");
   oledKV("Cal", String(g_calibration, 2));
   oledKV("TareRaw", String(g_tareRaw));
+  if (g_hasResult) {
+    oledKV("Last F (lb)", String(g_lastAvgLb, 3));
+    oledKV("Last COF",   String(g_lastCOF, 3));
+  }
   oled.println(F("Start=Run | Zero=Tar/Cal"));
   oled.display();
 
@@ -384,6 +407,7 @@ void loop() {
     tareNow();
     oledHeader("Tare Done");
     oledKV("TareRaw", String(g_tareRaw));
+    if (g_hasResult) { oledKV("Last COF", String(g_lastCOF, 3)); }
     oled.display();
     delay(600);
     return;
@@ -393,11 +417,24 @@ void loop() {
 
   if (sp) {
     RunResult r = runTest();
+    g_lastAvgLb = r.avgFrictionLb;
+    g_lastCOF   = r.cof;
+    g_hasResult = true;
+
     oledHeader("Result");
     oledKV("Avg F (lb)", String(r.avgFrictionLb, 3));
     oledKV("COF", String(r.cof, 3));
+    oled.println(F("Press START to test again"));
     oled.display();
-    delay(4000);
+
+    // Wait here showing the result until user decides next action
+    while (true) {
+      bool a=false,b=false,c=false,d=false;
+      readButton(btnStart, a, b);
+      readButton(btnZero,  c, d);
+      if (a || b || c || d) break;
+      delay(10);
+    }
     return;
   }
 }
