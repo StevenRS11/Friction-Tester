@@ -1,5 +1,5 @@
 /*
-  ESP32 Paddle COF Tester (continuous bidirectional test)
+  ESP32 Paddle COF Tester (continuous bidirectional test, non-blocking HX711)
   - DRV8825 + NEMA17
   - HX711 load cell amp
   - SSD1306 OLED (I2C)
@@ -36,30 +36,30 @@
 #define BTN_START   18
 #define BTN_ZERO    19
 
-const int   FULL_STEPS_PER_REV = 200;
-const float MICROSTEP           = 16.0;
-const float REVS_TOTAL          = 19.0;
+const int   FULL_STEPS_PER_REV = 200;     // 1.8° motor
+const float MICROSTEP           = 16.0;   // 1/16 microstepping
+const float REVS_TOTAL          = 19.0;   // 6.0 inches total
 const float INCHES_TOTAL        = 6.0;
 const float REVS_PER_INCH       = REVS_TOTAL / INCHES_TOTAL;
 const float STEPS_PER_REV       = FULL_STEPS_PER_REV * MICROSTEP;
 const float STEPS_PER_INCH      = STEPS_PER_REV * REVS_PER_INCH;
 
-const float SEG_LOWER_IN   = 2.5;
-const float SEG_NOISE_IN   = 0.5;
-const float SEG_MEASURE_IN = 3.0;
+const float SEG_LOWER_IN   = 2.5;  // ignore: lowering
+const float SEG_NOISE_IN   = 0.5;  // ignore: settle
+const float SEG_MEASURE_IN = 3.0;  // measure window
 
-const int    STEP_PULSE_US   = 600;
-const int    HOME_STEP_US    = 600;
-const int    BACKOFF_STEPS   = 800;
+const int    STEP_PULSE_US   = 600; // motion speed (lower = faster)
+const int    HOME_STEP_US    = 600; // homing speed
+const int    BACKOFF_STEPS   = 800; // homing backoff
 const bool   DIR_FORWARD     = true;
 const bool   DIR_HOME_TOWARD_LIMIT = !DIR_FORWARD;
 
 const uint32_t DEBOUNCE_MS   = 30;
 const uint32_t LONG_PRESS_MS = 1200;
 
-const float NORMAL_FORCE_LB  = 3.0;
-const int HX_SAMPLES_TARE    = 20;
-const int HX_SAMPLES_MEAS    = 5;
+const float NORMAL_FORCE_LB  = 3.0; // known normal force
+const int HX_SAMPLES_TARE    = 20;  // averaging for tare
+const int HX_SAMPLES_MEAS    = 5;   // UNUSED in non-blocking path (kept for compat)
 // ----------------------------------------------------------------------------
 
 Adafruit_SSD1306 oled(OLED_WIDTH, OLED_HEIGHT, &Wire);
@@ -70,8 +70,8 @@ const char* PREFS_NAMESPACE = "cof";
 const char* KEY_CAL         = "calib";
 const char* KEY_TARE        = "tare";
 
-float g_calibration = 1000.0f;
-long  g_tareRaw     = 0;
+float g_calibration = 1000.0f; // raw-to-lbs divisor
+long  g_tareRaw     = 0;       // tare offset (raw counts)
 
 struct Btn {
   uint8_t pin;
@@ -83,15 +83,29 @@ struct Btn {
 Btn btnStart{BTN_START, true, 0, 0, false};
 Btn btnZero {BTN_ZERO,  true, 0, 0, false};
 
-struct RunResult {
-  float avgFrictionLb;
-  float cof;
-};
-
-// Forward-declare measurement struct/function so Arduino's preprocessor can't
-// reorder things in a way that breaks the type resolution.
+// Results structs defined EARLY to avoid Arduino reordering issues
+struct RunResult { float avgFrictionLb; float cof; };
 struct MeasureResult { double avgLb; long count; };
+
+// Forward declarations for any cross-references
+void   stepperEnable(bool on);
+void   setDir(bool forward);
+void   doStepBlocking(int pulseUs);
+bool   limitHit();
+void   oledHeader(const char* line1);
+void   oledKV(const char* k, const String& v);
+void   showSplash();
+void   saveCalibration();
+void   loadCalibration();
+long   hxReadRawAvg(int n);
+float  rawToPounds(long raw);
+void   tareNow();
+void   doCalibration3lb();
+void   homeToLimit();
+void   moveStepsBlocking(long steps, bool forward, int pulseUs);
 MeasureResult measureDuringMove(long steps, bool forward, int pulseUs);
+RunResult runTest();
+bool   readButton(Btn& b, bool& shortPress, bool& longPress);
 
 // ----------------------------- Utils ----------------------------------------
 void stepperEnable(bool on) { digitalWrite(PIN_EN, on ? LOW : HIGH); }
@@ -122,7 +136,7 @@ void oledHeader(const char* line1) {
 
 void oledKV(const char* k, const String& v) {
   oled.print(k);
-  oled.print(": ");
+  oled.print(F(": "));
   oled.println(v);
 }
 
@@ -162,14 +176,9 @@ long hxReadRawAvg(int n) {
   return sum / n;
 }
 
-float rawToPounds(long raw) {
-  return (float)(raw - g_tareRaw) / g_calibration;
-}
+float rawToPounds(long raw) { return (float)(raw - g_tareRaw) / g_calibration; }
 
-void tareNow() {
-  g_tareRaw = hxReadRawAvg(HX_SAMPLES_TARE);
-  saveCalibration();
-}
+void tareNow() { g_tareRaw = hxReadRawAvg(HX_SAMPLES_TARE); saveCalibration(); }
 
 void doCalibration3lb() {
   oledHeader("Calibration (3 lb)");
@@ -211,7 +220,6 @@ void doCalibration3lb() {
 void homeToLimit() {
   stepperEnable(true);
   setDir(DIR_HOME_TOWARD_LIMIT);
-
   while (!limitHit()) doStepBlocking(HOME_STEP_US);
 
   setDir(!DIR_HOME_TOWARD_LIMIT);
@@ -229,16 +237,19 @@ void moveStepsBlocking(long steps, bool forward, int pulseUs) {
   for (long i=0; i<steps; i++) doStepBlocking(pulseUs);
 }
 
+// Non-blocking measurement during motion
 MeasureResult measureDuringMove(long steps, bool forward, int pulseUs) {
   setDir(forward);
   double sumF = 0.0;
-  long nF = 0;
+  long   nF   = 0;
   for (long i = 0; i < steps; i++) {
-    doStepBlocking(pulseUs);
-    long raw = hxReadRawAvg(HX_SAMPLES_MEAS);
-    float lbs = rawToPounds(raw);
-    sumF += lbs;
-    nF++;
+    doStepBlocking(pulseUs);        // keep motion timing tight
+    if (scale.is_ready()) {         // read only if ready (no waiting)
+      long raw = scale.read();
+      float lbs = rawToPounds(raw);
+      sumF += lbs;
+      nF++;
+    }
   }
   MeasureResult mr;
   mr.avgLb = (nF > 0) ? (sumF / (double)nF) : 0.0;
@@ -260,8 +271,8 @@ RunResult runTest() {
   oled.display();
 
   stepperEnable(true);
-  moveStepsBlocking(steps_lower,  DIR_FORWARD, STEP_PULSE_US);
-  moveStepsBlocking(steps_noise,  DIR_FORWARD, STEP_PULSE_US);
+  moveStepsBlocking(steps_lower,  DIR_FORWARD, STEP_PULSE_US); // ignore
+  moveStepsBlocking(steps_noise,  DIR_FORWARD, STEP_PULSE_US); // ignore
 
   oledHeader("Measuring (FWD)...");
   oled.display();
@@ -276,8 +287,8 @@ RunResult runTest() {
 
   oledHeader("Returning...");
   oled.display();
-  moveStepsBlocking(steps_noise,  !DIR_FORWARD, STEP_PULSE_US);
-  moveStepsBlocking(steps_lower,  !DIR_FORWARD, STEP_PULSE_US);
+  moveStepsBlocking(steps_noise,  !DIR_FORWARD, STEP_PULSE_US); // ignore
+  moveStepsBlocking(steps_lower,  !DIR_FORWARD, STEP_PULSE_US); // ignore
 
   homeToLimit();
   stepperEnable(false);
@@ -293,26 +304,19 @@ RunResult runTest() {
 bool readButton(Btn& b, bool& shortPress, bool& longPress) {
   shortPress = false;
   longPress  = false;
-  bool cur = digitalRead(b.pin);
+  bool cur = digitalRead(b.pin); // INPUT_PULLUP: LOW when pressed
   uint32_t now = millis();
 
   if (cur != b.last && (now - b.lastChange) > DEBOUNCE_MS) {
     b.last = cur;
     b.lastChange = now;
-    if (cur == LOW) {
-      b.downAt = now;
-      b.longSent = false;
-    } else {
+    if (cur == LOW) { b.downAt = now; b.longSent = false; }
+    else {
       uint32_t held = now - b.downAt;
-      if (!b.longSent && held >= DEBOUNCE_MS && held < LONG_PRESS_MS)
-        shortPress = true;
+      if (!b.longSent && held >= DEBOUNCE_MS && held < LONG_PRESS_MS) shortPress = true;
     }
   }
-
-  if (b.last == LOW && !b.longSent && (now - b.downAt) >= LONG_PRESS_MS) {
-    longPress = true;
-    b.longSent = true;
-  }
+  if (b.last == LOW && !b.longSent && (now - b.downAt) >= LONG_PRESS_MS) { longPress = true; b.longSent = true; }
   return (shortPress || longPress);
 }
 
@@ -321,11 +325,12 @@ void setup() {
   pinMode(PIN_STEP, OUTPUT);
   pinMode(PIN_DIR, OUTPUT);
   pinMode(PIN_EN, OUTPUT);
-  pinMode(PIN_LIMIT, INPUT_PULLUP);
-  pinMode(BTN_START, INPUT_PULLUP);
-  pinMode(BTN_ZERO,  INPUT_PULLUP);
+  pinMode(PIN_LIMIT, INPUT_PULLUP); // active-LOW
+  pinMode(BTN_START, INPUT_PULLUP); // active-LOW
+  pinMode(BTN_ZERO,  INPUT_PULLUP); // active-LOW
 
   stepperEnable(false);
+
   Wire.begin(I2C_SDA, I2C_SCL);
   oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
   oled.clearDisplay();
@@ -337,6 +342,7 @@ void setup() {
   showSplash();
   delay(500);
 
+  // Initialization homing sequence
   oledHeader("Initializing...");
   oled.println(F("Checking limit..."));
   oled.display();
@@ -383,10 +389,7 @@ void loop() {
     return;
   }
 
-  if (lz) {
-    doCalibration3lb();
-    return;
-  }
+  if (lz) { doCalibration3lb(); return; }
 
   if (sp) {
     RunResult r = runTest();
