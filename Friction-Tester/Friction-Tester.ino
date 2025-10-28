@@ -57,7 +57,9 @@ const bool   DIR_HOME_TOWARD_LIMIT = !DIR_FORWARD;
 const uint32_t DEBOUNCE_MS   = 30;
 const uint32_t LONG_PRESS_MS = 1200;
 
-const float NORMAL_FORCE_LB  = 3.0; // known normal force
+const float NORMAL_FORCE_LB  = 2.784; // known normal force
+const float CAL_FORCE_LB  = 3.085; // known normal force
+
 const int HX_SAMPLES_TARE    = 20;  // averaging for tare
 const int HX_SAMPLES_MEAS    = 5;   // UNUSED in non-blocking path (kept for compat)
 // ----------------------------------------------------------------------------
@@ -221,7 +223,7 @@ void doCalibration3lb() {
 
   // Calibration math: counts-per-pound = delta / 3.0
   // We store g_calibration as counts per lb so lbs = (raw - tare)/g_calibration
-  g_calibration = (float)delta / NORMAL_FORCE_LB;
+  g_calibration = (float)delta / CAL_FORCE_LB;
   saveCalibration();
 
   oledHeader("CAL DONE");
