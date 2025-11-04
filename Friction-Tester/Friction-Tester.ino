@@ -49,9 +49,9 @@ const float SEG_LOWER_IN   = 2.5;  // ignore: lowering
 const float SEG_NOISE_IN   = 0.5;  // ignore: settle
 const float SEG_MEASURE_IN = 3.0;  // measure window
 
-const int    STEP_PULSE_US   = 600; // motion speed (lower = faster)
+const int    STEP_PULSE_US   = 300; // motion speed (lower = faster)
 const int    HOME_STEP_US    = 600; // homing speed
-const int    BACKOFF_STEPS   = 800; // homing backoff
+const int    BACKOFF_STEPS   = 600; // homing backoff
 const bool   DIR_FORWARD     = true;
 const bool   DIR_HOME_TOWARD_LIMIT = !DIR_FORWARD;
 
@@ -200,8 +200,8 @@ void doCalibration3lb() {
   g_tareRaw = hxReadRawAvg(HX_SAMPLES_TARE);
 
   // ---- Step 2: Known weight ----
-  oledHeader("CAL: Step 2/2 (3 lb)");
-  oled.println(F("Place 3.00 lb weight"));
+  oledHeader("CAL: Step 2/2 (3.085 lb)");
+  oled.println(F("Place 3.085 lb weight"));
   oled.println(F("Press START to sample"));
   oled.display();
 
@@ -209,7 +209,7 @@ void doCalibration3lb() {
   while (digitalRead(BTN_START) == LOW)  delay(5);
 
   long raw3 = hxReadRawAvg(HX_SAMPLES_TARE);
-  long delta = raw3 - g_tareRaw; // counts due to 3 lb
+  long delta = raw3 - g_tareRaw; // counts due to 3.085 lb
 
   if (abs(delta) < 100) {
     oledHeader("CAL FAILED");
@@ -224,7 +224,7 @@ void doCalibration3lb() {
   saveCalibration();
 
   oledHeader("CAL DONE");
-  oledKV("Counts@3lb", String(delta));
+  oledKV("Counts@3.085lb", String(delta));
   oledKV("Cal (cnt/lb)", String(g_calibration, 2));
   oledKV("TareRaw", String(g_tareRaw));
   oled.display();
@@ -415,10 +415,7 @@ void setup() {
 void loop() {
   // Idle screen
   oledHeader("Idle");
-  oledKV("Cal", String(g_calibration, 2));
-  oledKV("TareRaw", String(g_tareRaw));
   if (g_hasResult) {
-    oledKV("Last F (lb)", String(g_lastAvgLb, 3));
     oledKV("Last COF",   String(g_lastCOF, 3));
   }
   oled.println(F("Start=Run | Zero=Tar/Cal"));
@@ -453,8 +450,8 @@ void loop() {
         g_hasResult = true;
 
         oledHeader("Result");
-        oledKV("Avg F (lb)", String(r.avgFrictionLb, 3));
         oledKV("COF", String(r.cof, 3));
+        oled.println(F("Assuming N = 3 lb"));
         oled.println(F("Press START to test again"));
         oled.display();
 
