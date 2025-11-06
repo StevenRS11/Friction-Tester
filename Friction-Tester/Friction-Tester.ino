@@ -23,14 +23,14 @@
 #define OLED_HEIGHT  64
 #define OLED_ADDR    0x3C
 
-#define HX_DOUT  33
-#define HX_SCK   25
+#define HX_DOUT  35
+#define HX_SCK   36
 
 #define PIN_STEP  17
 #define PIN_DIR   16
 #define PIN_EN    27   // Active LOW
 
-#define PIN_LIMIT  32
+#define PIN_LIMIT  18
 #define LIMIT_ACTIVE_LOW 1
 
 #define BTN_START   18
