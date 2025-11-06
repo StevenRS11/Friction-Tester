@@ -28,7 +28,7 @@
 
 #define PIN_STEP  17
 #define PIN_DIR   16
-#define PIN_EN    27   // Active LOW
+#define PIN_EN    47   // Active LOW
 
 #define PIN_LIMIT  18
 #define LIMIT_ACTIVE_LOW 1
