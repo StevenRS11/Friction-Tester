@@ -16,8 +16,8 @@
 #include <Preferences.h>
 
 // ----------------------------- USER CONFIG ----------------------------------
-#define I2C_SDA 22
-#define I2C_SCL 23
+#define I2C_SDA 8
+#define I2C_SCL 9
 
 #define OLED_WIDTH   128
 #define OLED_HEIGHT  64
