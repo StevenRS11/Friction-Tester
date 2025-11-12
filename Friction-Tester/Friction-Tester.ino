@@ -34,8 +34,8 @@
 #define PIN_LIMIT  18
 #define LIMIT_ACTIVE_LOW 1
 
-#define BTN_START   18
-#define BTN_ZERO    19
+#define BTN_START   20
+#define BTN_ZERO    21
 
 const int   FULL_STEPS_PER_REV = 200;     // 1.8° motor
 const float MICROSTEP           = 16.0;   // 1/16 microstepping
