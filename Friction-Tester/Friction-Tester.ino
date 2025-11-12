@@ -17,21 +17,21 @@
 #include <math.h>
 
 // ----------------------------- USER CONFIG ----------------------------------
-#define I2C_SDA 22
-#define I2C_SCL 23
+#define I2C_SDA 8
+#define I2C_SCL 9
 
 #define OLED_WIDTH   128
 #define OLED_HEIGHT  64
 #define OLED_ADDR    0x3C
 
-#define HX_DOUT  33
-#define HX_SCK   25
+#define HX_DOUT  5
+#define HX_SCK   6
 
 #define PIN_STEP  17
 #define PIN_DIR   16
-#define PIN_EN    27   // Active LOW
+#define PIN_EN    47   // Active LOW
 
-#define PIN_LIMIT  32
+#define PIN_LIMIT  18
 #define LIMIT_ACTIVE_LOW 1
 
 #define BTN_START   18
