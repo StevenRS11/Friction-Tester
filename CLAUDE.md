@@ -47,9 +47,11 @@ arduino-cli monitor -p <PORT>
 The system uses a linear motion profile divided into segments:
 
 1. **Lowering segment** (2.5"): Initial descent ignored during measurement
-2. **Noise settling segment** (0.5"): Allows vibrations to stabilize
-3. **Measurement segment** (3.0"): Active data collection window
-4. Total travel: 6.0 inches = 19 motor revolutions
+2. **Measurement segment** (3.0" total):
+   - First 0.25": Settling/trim (motion but no data collection)
+   - Middle 2.5": Active data collection window
+   - Last 0.25": Trim (motion but no data collection)
+3. Total travel: 5.5 inches
 
 **Key calculations:**
 - `STEPS_PER_REV = 200 steps × 16 microsteps = 3200`
@@ -82,7 +84,7 @@ Uses ESP32 Preferences (NVS) to persist two values:
 
 **Calibration procedure (long-press ZERO button):**
 1. Tare: averages 20 HX711 readings with no load
-2. Known weight: user places 3.085 lb weight, system samples and calculates `counts/lb`
+2. Known weight: user places calibration weight (specified by CAL_WEIGHT_LB constant), system samples and calculates `counts/lb`
 
 **Quick tare (short-press ZERO button):**
 Re-zeros without recalculating calibration factor.
@@ -137,11 +139,14 @@ Located in USER CONFIG section (lines 19-65):
 
 **Test geometry:**
 - `REVS_TOTAL`, `INCHES_TOTAL`: Defines steps-to-distance conversion
-- `SEG_LOWER_IN`, `SEG_NOISE_IN`, `SEG_MEASURE_IN`: Test segment lengths
+- `SEG_LOWER_IN`: Lowering phase distance (2.5")
+- `SEG_NOISE_IN`: (Currently 0.0, settling handled by SEG_TRIM_IN)
+- `SEG_MEASURE_IN`: Total measurement segment length (3.0")
+- `SEG_TRIM_IN`: Trim/settling distance at start and end of measurement (0.25")
 
 **Calibration:**
-- `CAL_WEIGHT_LB`: Known calibration weight (3.085 lb)
-- `NORMAL_FORCE_LB`: Expected normal force during test (2.7842 lb)
+- `CAL_WEIGHT_LB`: Known calibration weight in pounds (configurable, e.g., 3.883 lb)
+- `NORMAL_FORCE_LB`: Expected normal force during test in pounds (configurable, e.g., 3.59 lb)
 - `HX_SAMPLES_TARE`: Averaging samples for calibration (20)
 
 ## Common Modifications
@@ -150,7 +155,7 @@ Located in USER CONFIG section (lines 19-65):
 Modify `STEP_PULSE_US` (line 52). Lower = faster, but too low may cause missed steps.
 
 **To adjust measurement window:**
-Modify `SEG_MEASURE_IN` (line 50). Ensure total travel doesn't exceed mechanical limits.
+Modify `SEG_MEASURE_IN` for total segment length and `SEG_TRIM_IN` for settling distances. Ensure total travel doesn't exceed mechanical limits. Actual measurement distance = SEG_MEASURE_IN - (2 × SEG_TRIM_IN).
 
 **To change normal force assumption:**
 Update `NORMAL_FORCE_LB` (line 62) and recalibrate if paddle weight changes.
