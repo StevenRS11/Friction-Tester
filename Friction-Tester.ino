@@ -16,31 +16,33 @@
 #include <HX711.h>
 #include <Preferences.h>
 #include <Adafruit_NeoPixel.h>
+#include <PaddleDNA.h>
 #include <math.h>
 
 // ----------------------------- USER CONFIG ----------------------------------
-// NOTE: Pin assignments below are for specific ESP32 variant in use
-// Adjust these based on your hardware configuration
+// NOTE: Pin assignments below match PCB schematic (ESP32-S3-ZERO)
+// ESP32-S3 Pin Restrictions: Avoid GPIO 26-32 (reserved/problematic)
+// See schematic for hardware pullups and connections
 
-#define I2C_SDA 8
-#define I2C_SCL 9
+#define I2C_SDA 12     // Shared I2C bus (OLED + RFID)
+#define I2C_SCL 11     // Shared I2C bus (OLED + RFID)
 
 #define OLED_WIDTH   128
 #define OLED_HEIGHT  64
 #define OLED_ADDR    0x3C
 
-#define HX_DOUT  5
-#define HX_SCK   6
+#define HX_DOUT  5    // HX711 load cell data
+#define HX_SCK   6    // HX711 load cell clock
 
-#define PIN_STEP  17
-#define PIN_DIR   16
-#define PIN_EN    47   // Active LOW
+#define PIN_STEP  7   // DRV8825 step pin
+#define PIN_DIR   2  // DRV8825 direction pin
+#define PIN_EN    3  // DRV8825 enable (Active LOW)
 
-#define PIN_LIMIT  18  // Limit switch input
+#define PIN_LIMIT  4  // Limit switch input (active-LOW with 10K pullup)
 #define LIMIT_ACTIVE_LOW 1
 
-#define BTN_START   20  // Start button input
-#define BTN_ZERO    21  // Zero/Calibration button input
+#define BTN_START  10 // Start button (active-LOW with 10K pullup)
+#define BTN_ZERO   9  // Zero/Calibration button (active-LOW with 10K pullup)
 
 #define RGB_LED_PIN 48   // Onboard RGB LED (ESP32-S3)
 
@@ -70,12 +72,38 @@ const float CAL_WEIGHT_LB    = 3.883;   // calibration weight
 const float NORMAL_FORCE_LB  = 3.59;  // test normal force
 const int HX_SAMPLES_TARE    = 20;      // averaging for tare
 const int HX_SAMPLES_MEAS    = 5;       // (unused by non-blocking read)
+
+// Machine identification for PaddleDNA (update these for each machine)
+const int MACHINE_ID = 00002;  // Machine identifier for display
+
+// Machine UUID: Generate unique UUID per machine
+// Example UUID for Friction Tester #2: a1b2c3d4-e5f6-7890-abcd-ef1234567890
+const uint8_t MACHINE_UUID[16] = {
+  0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x78, 0x90,
+  0xab, 0xcd, 0xef, 0x12, 0x34, 0x56, 0x78, 0x90
+};
+
+// Stub private key (32 bytes of 0xCC for MVP - crypto is stub implementation)
+const uint8_t PRIVATE_KEY[32] = {
+  0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+  0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+  0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+  0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC
+};
+
+// Hardcoded timestamp for 2026-01-12 00:00:00 UTC
+const uint32_t FIXED_TIMESTAMP = 1768176000;
 // ----------------------------------------------------------------------------
 
 Adafruit_SSD1306 oled(OLED_WIDTH, OLED_HEIGHT, &Wire);
 HX711 scale;
 Preferences prefs;
 Adafruit_NeoPixel rgbLed(1, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
+
+// PaddleDNA components
+PaddleDNA::NFC nfc;
+PaddleDNA::Crypto crypto;
+PaddleDNA::MeasurementAccumulator* accumulator = nullptr;
 
 bool  g_hasResult = false;
 float g_lastAvgLb = 0.0f;
@@ -132,6 +160,11 @@ void   ledOff();
 void   rainbowCycle(int durationMs);
 void   pulseLED(uint8_t r, uint8_t g, uint8_t b, int times, int pulseMs);
 uint32_t colorWheel(byte pos);
+void   displayTestResults(float cof, int machineID);
+void   displayRFIDSuccess();
+void   displayRFIDRetry(int attemptsLeft);
+void   displayRFIDFinalFailure();
+bool   writeToRFID(float cofValue);
 
 // ----------------------------- Utils ----------------------------------------
 void stepperEnable(bool on) { digitalWrite(PIN_EN, on ? LOW : HIGH); }
@@ -589,6 +622,214 @@ bool readButton(Btn& b, bool& shortPress, bool& longPress) {
   return (shortPress || longPress);
 }
 
+// ----------------------------- RFID Functions -------------------------------
+// Display COF results with RFID prompt
+void displayTestResults(float cof, int machineID) {
+  oled.clearDisplay();
+
+  char cofStr[10];
+  dtostrf(cof, 1, 3, cofStr);
+
+  // Display results - split screen vertically
+  oled.setTextSize(1);
+  oled.setTextColor(SSD1306_WHITE);
+
+  // Left side: COF value
+  oled.setCursor(0, 8);
+  oled.println("COF");
+  oled.setCursor(0, 18);
+  oled.println("----------");
+  oled.setCursor(0, 28);
+  oled.setTextSize(2);
+  oled.println(cofStr);
+
+  // Right side: Present NFC prompt
+  oled.setTextSize(1);
+  oled.setCursor(75, 20);
+  oled.println("Present");
+  oled.setCursor(80, 30);
+  oled.println("NFC");
+
+  oled.display();
+}
+
+// Display RFID write success
+void displayRFIDSuccess() {
+  oled.clearDisplay();
+  oled.setTextSize(2);
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setCursor(20, 24);
+  oled.println("Success!");
+  oled.display();
+  pulseLED(0, 255, 0, 2, 300); // Green pulse
+  delay(1500);
+}
+
+// Display RFID retry prompt
+void displayRFIDRetry(int attemptsLeft) {
+  oled.clearDisplay();
+  oled.setTextSize(1);
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setCursor(30, 20);
+  oled.println("Try again");
+  oled.setCursor(15, 35);
+  oled.print("(");
+  oled.print(attemptsLeft);
+  oled.print(" attempts left)");
+  oled.display();
+  setLED(255, 150, 0); // Orange/yellow for retry
+  delay(1000);
+  ledOff();
+}
+
+// Display RFID write final failure
+void displayRFIDFinalFailure() {
+  oled.clearDisplay();
+  oled.setTextSize(1);
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setCursor(15, 20);
+  oled.println("Write failed");
+  oled.setCursor(10, 35);
+  oled.println("Continuing...");
+  oled.display();
+  pulseLED(255, 0, 0, 2, 300); // Red pulse for failure
+  delay(3000);
+}
+
+// Write measurement to RFID tag with polling and retry
+// Returns: true if successful, false if aborted or failed after 5 retries
+bool writeToRFID(float cofValue) {
+  Serial.println("Starting RFID write process...");
+  Serial.print("COF value: ");
+  Serial.println(cofValue, 3);
+
+  // Create measurement (CoF type)
+  PaddleDNA::Measurement measurement(
+    PaddleDNA::MeasurementType::CoF,
+    MACHINE_UUID,
+    FIXED_TIMESTAMP,
+    cofValue
+  );
+
+  const int MAX_RETRIES = 5;
+  int attemptNumber = 0;
+  const unsigned long TAG_WAIT_TIMEOUT = 30000;  // 30 seconds per attempt
+
+  while (attemptNumber < MAX_RETRIES) {
+    unsigned long attemptStartTime = millis();
+    unsigned long lastPollTime = 0;
+
+    Serial.print("Attempt ");
+    Serial.print(attemptNumber + 1);
+    Serial.print(" of ");
+    Serial.println(MAX_RETRIES);
+
+    // Poll for tag until timeout or success/error
+    while (millis() - attemptStartTime < TAG_WAIT_TIMEOUT) {
+      // Check for abort (button hold 2+ seconds)
+      if (digitalRead(BTN_START) == LOW) {
+        unsigned long holdStart = millis();
+        while (digitalRead(BTN_START) == LOW && (millis() - holdStart < 2000)) {
+          delay(10);
+        }
+        if (millis() - holdStart >= 2000) {
+          // Abort
+          oled.clearDisplay();
+          oled.setTextSize(1);
+          oled.setTextColor(SSD1306_WHITE);
+          oled.setCursor(30, 24);
+          oled.println("Aborted");
+          oled.display();
+          setLED(255, 0, 0);
+          delay(1000);
+          ledOff();
+          return false;
+        }
+      }
+
+      // Poll for tag every 250ms
+      if (millis() - lastPollTime < 250) {
+        delay(10);
+        continue;
+      }
+      lastPollTime = millis();
+
+      // Blink LED during polling (blue)
+      static bool ledState = false;
+      if (ledState) {
+        setLED(0, 0, 255);
+      } else {
+        ledOff();
+      }
+      ledState = !ledState;
+
+      // Try to accumulate measurement
+      String msg;
+      PaddleDNA::AccumulateResult result = accumulator->accumulate(measurement, &msg);
+
+      Serial.print("Accumulate result: ");
+      Serial.print((int)result);
+      Serial.print(" - ");
+      Serial.println(msg);
+
+      switch (result) {
+        case PaddleDNA::AccumulateResult::Success:
+          ledOff();
+          displayRFIDSuccess();
+          return true;
+
+        case PaddleDNA::AccumulateResult::NoTag:
+          // Keep polling silently
+          break;
+
+        case PaddleDNA::AccumulateResult::TagFull:
+          ledOff();
+          oled.clearDisplay();
+          oled.setTextSize(1);
+          oled.setTextColor(SSD1306_WHITE);
+          oled.setCursor(15, 16);
+          oled.println("Tag is full!");
+          oled.setCursor(10, 32);
+          oled.println("Use a new tag");
+          oled.display();
+          pulseLED(255, 0, 0, 3, 300);
+          delay(3000);
+          return false;
+
+        case PaddleDNA::AccumulateResult::ReadError:
+        case PaddleDNA::AccumulateResult::WriteError:
+        case PaddleDNA::AccumulateResult::InvalidPayload:
+        case PaddleDNA::AccumulateResult::CryptoError:
+          // Error encountered - count as a failed attempt
+          ledOff();
+          attemptNumber++;
+
+          if (attemptNumber < MAX_RETRIES) {
+            // Show retry message
+            displayRFIDRetry(MAX_RETRIES - attemptNumber);
+          }
+          // Break out of polling loop to start next attempt
+          goto next_attempt;
+      }
+    }
+
+    // If we get here, timeout occurred (no tag detected)
+    ledOff();
+    attemptNumber++;
+    if (attemptNumber < MAX_RETRIES) {
+      displayRFIDRetry(MAX_RETRIES - attemptNumber);
+    }
+
+    next_attempt:
+    continue;
+  }
+
+  // All retries exhausted
+  ledOff();
+  displayRFIDFinalFailure();
+  return false;
+}
+
 // ----------------------------- Live Force Overlay ---------------------------
 unsigned long g_lastForceDrawMs = 0;
 void updateLiveForceLine(bool forceClear) {
@@ -652,10 +893,50 @@ void setup() {
 
   Serial.println("Initializing I2C and OLED...");
   Wire.begin(I2C_SDA, I2C_SCL);
+  delay(100);  // Critical delay for ESP32-S3 I2C stability
   oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
   oled.clearDisplay();
   oled.display();
   Serial.println("OLED ready");
+
+  // Initialize PaddleDNA NFC
+  Serial.println("Initializing PaddleDNA NFC...");
+  if (!nfc.begin(Wire)) {
+    Serial.println(F("NFC initialization failed!"));
+    oled.clearDisplay();
+    oled.setTextSize(1);
+    oled.setCursor(0, 20);
+    oled.println("NFC INIT FAILED!");
+    oled.setCursor(0, 35);
+    oled.println("Check connections");
+    oled.display();
+    pulseLED(255, 0, 0, 5, 300); // Red pulse error
+    delay(3000);
+    // Continue anyway - allow force measurements without RFID
+  } else {
+    Serial.println("NFC initialized successfully");
+  }
+
+  // Initialize PaddleDNA Crypto
+  Serial.println("Initializing PaddleDNA Crypto...");
+  if (!crypto.begin(MACHINE_UUID, PRIVATE_KEY)) {
+    Serial.println(F("Crypto initialization failed!"));
+    oled.clearDisplay();
+    oled.setTextSize(1);
+    oled.setCursor(0, 20);
+    oled.println("CRYPTO INIT FAILED!");
+    oled.display();
+    pulseLED(255, 0, 0, 5, 300);
+    delay(3000);
+    // Continue anyway
+  } else {
+    Serial.println("Crypto initialized successfully");
+  }
+
+  // Create MeasurementAccumulator (paddle UUID auto-detected from tag)
+  Serial.println("Creating MeasurementAccumulator...");
+  accumulator = new PaddleDNA::MeasurementAccumulator(nfc, crypto, 9);
+  Serial.println("MeasurementAccumulator created successfully");
 
   Serial.println("Initializing HX711 load cell...");
   scale.begin(HX_DOUT, HX_SCK);
@@ -742,10 +1023,30 @@ void loop() {
 
         Serial.print("Test complete! COF: ");
         Serial.println(r.cof, 3);
+
+        // Display results with "Present NFC tag..." message
+        displayTestResults(r.cof, MACHINE_ID);
+
+        // Write to RFID tag (with retry and abort handling)
+        Serial.println("Entering RFID write mode...");
+        bool rfidSuccess = writeToRFID(r.cof);
+
+        if (rfidSuccess) {
+          Serial.println("RFID write successful");
+        } else {
+          Serial.println("RFID write failed or aborted");
+        }
+
+        // Show final result screen
         oledHeader("Result");
         oledKV("COF", String(r.cof, 3));
-        oled.println(F("Assuming N = 3 lb"));
-        oled.println(F("Press START to test again"));
+        oled.print(F("N = "));
+        oled.print(NORMAL_FORCE_LB, 2);
+        oled.println(F(" lb"));
+        if (rfidSuccess) {
+          oled.println(F("Data saved to tag"));
+        }
+        oled.println(F("Press any button..."));
         oled.display();
 
         // Wait here showing the result until any button input
