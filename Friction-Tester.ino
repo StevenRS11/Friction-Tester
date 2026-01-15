@@ -109,6 +109,52 @@ bool  g_hasResult = false;
 float g_lastAvgLb = 0.0f;
 float g_lastCOF   = 0.0f;
 
+// ======================== DUAL-CORE ARCHITECTURE ============================
+// Motion phases for tracking
+enum MotionPhase {
+  PHASE_NONE,
+  PHASE_LOWERING,
+  PHASE_MEASURING_FWD,
+  PHASE_MEASURING_REV,
+  PHASE_RETURNING,
+  PHASE_HOMING
+};
+
+// Motion commands
+enum MotionCommand {
+  CMD_NONE,
+  CMD_HOME,
+  CMD_MOVE,
+  CMD_MEASURE_MOVE,
+  CMD_ENABLE,
+  CMD_DISABLE
+};
+
+struct MotionRequest {
+  MotionCommand cmd;
+  long steps;
+  bool direction;
+  int pulseUs;
+  MotionPhase phase;
+};
+
+// Global state (shared between cores)
+volatile MotionPhase g_currentPhase = PHASE_NONE;
+volatile bool g_collectSamples = false;  // Signal Core 0 to sample
+
+// Sample storage (Core 0 writes, Core 1 never touches)
+#define MAX_SAMPLES_PER_PASS 2000
+float g_fwdSamples[MAX_SAMPLES_PER_PASS];
+float g_revSamples[MAX_SAMPLES_PER_PASS];
+volatile long g_fwdSampleCount = 0;
+volatile long g_revSampleCount = 0;
+
+// Inter-core communication
+QueueHandle_t motionCommandQueue = NULL;
+SemaphoreHandle_t motionCompleteSemaphore = NULL;
+TaskHandle_t forceSamplingTaskHandle = NULL;
+// ============================================================================
+
 const char* PREFS_NAMESPACE = "cof";
 const char* KEY_CAL         = "calib";
 const char* KEY_TARE        = "tare";
@@ -165,6 +211,15 @@ void   displayRFIDSuccess();
 void   displayRFIDRetry(int attemptsLeft);
 void   displayRFIDFinalFailure();
 bool   writeToRFID(float cofValue);
+
+// Dual-core function prototypes
+void   motionTask(void* parameter);
+void   forceSamplingTask(void* parameter);
+void   executePureMove(long steps, bool forward, int pulseUs);
+bool   executeHome();
+bool   requestMotion(MotionRequest req, uint32_t timeoutMs = 60000);
+void   homeToLimitSafe();
+void   moveStepsBlockingSafe(long steps, bool forward, int pulseUs);
 
 // ----------------------------- Utils ----------------------------------------
 void stepperEnable(bool on) { digitalWrite(PIN_EN, on ? LOW : HIGH); }
@@ -372,6 +427,201 @@ void doCalibration3lb() {
 // ----------------------------- Motion ---------------------------------------
 bool g_motionActive = false; // used to suppress OLED live updates during motion
 
+// ==================== DUAL-CORE MOTION FUNCTIONS ============================
+
+// Core 1: Pure stepping function (NO HX711, NO I2C, NO Serial in critical loop)
+void executePureMove(long steps, bool forward, int pulseUs) {
+  setDir(forward);
+
+  for (long i = 0; i < steps; i++) {
+    doStepBlocking(pulseUs);
+    // That's it! Pure stepping only
+  }
+}
+
+// Core 1: Homing sequence (called from motion task)
+bool executeHome() {
+  const uint32_t HOMING_TIMEOUT_MS = 20000;
+
+  stepperEnable(true);
+  setDir(DIR_HOME_TOWARD_LIMIT);
+
+  // First approach
+  uint32_t startTime = millis();
+  while (!limitHit()) {
+    if (millis() - startTime > HOMING_TIMEOUT_MS) {
+      stepperEnable(false);
+      return false;
+    }
+    doStepBlocking(HOME_STEP_US);
+  }
+
+  // Back off
+  setDir(!DIR_HOME_TOWARD_LIMIT);
+  for (int i = 0; i < BACKOFF_STEPS; i++) {
+    doStepBlocking(HOME_STEP_US);
+  }
+
+  // Second approach
+  setDir(DIR_HOME_TOWARD_LIMIT);
+  startTime = millis();
+  while (!limitHit()) {
+    if (millis() - startTime > HOMING_TIMEOUT_MS) {
+      stepperEnable(false);
+      return false;
+    }
+    doStepBlocking(HOME_STEP_US);
+  }
+
+  // Final back off
+  setDir(!DIR_HOME_TOWARD_LIMIT);
+  for (int i = 0; i < BACKOFF_STEPS / 2; i++) {
+    doStepBlocking(HOME_STEP_US);
+  }
+
+  stepperEnable(false);
+  return true;
+}
+
+// Core 1: Motion task (runs exclusively on Core 1)
+void motionTask(void* parameter) {
+  // Disable watchdog on Core 1
+  disableCore1WDT();
+
+  Serial.println("Motion task started on Core 1");
+  Serial.print("Motion task running on core: ");
+  Serial.println(xPortGetCoreID());
+
+  MotionRequest req;
+
+  while (true) {
+    // Wait for motion command (yields CPU while waiting)
+    if (xQueueReceive(motionCommandQueue, &req, portMAX_DELAY) == pdTRUE) {
+      g_motionActive = true;
+
+      // Execute command with NO interruptions
+      switch (req.cmd) {
+        case CMD_HOME:
+          g_currentPhase = PHASE_HOMING;
+          executeHome();
+          break;
+
+        case CMD_MOVE:
+          // Simple move (lowering or returning)
+          g_currentPhase = req.phase;
+          executePureMove(req.steps, req.direction, req.pulseUs);
+          break;
+
+        case CMD_MEASURE_MOVE:
+          // Critical measurement phase
+          g_currentPhase = req.phase;
+          g_collectSamples = true;  // Signal Core 0 to start sampling
+
+          executePureMove(req.steps, req.direction, req.pulseUs);
+
+          g_collectSamples = false;  // Stop sampling
+          break;
+
+        case CMD_ENABLE:
+          stepperEnable(true);
+          break;
+
+        case CMD_DISABLE:
+          stepperEnable(false);
+          break;
+      }
+
+      g_motionActive = false;
+      g_currentPhase = PHASE_NONE;
+
+      // Signal completion
+      xSemaphoreGive(motionCompleteSemaphore);
+    }
+  }
+}
+
+// Core 0: Force sampling task (runs in parallel on Core 0)
+void forceSamplingTask(void* parameter) {
+  Serial.println("Force sampling task started on Core 0");
+  Serial.print("Force sampling task running on core: ");
+  Serial.println(xPortGetCoreID());
+
+  while (true) {
+    // Wait for sampling signal
+    if (g_collectSamples) {
+
+      // Determine which buffer to use
+      float* sampleBuffer = NULL;
+      volatile long* sampleCount = NULL;
+      long maxSamples = MAX_SAMPLES_PER_PASS;
+
+      if (g_currentPhase == PHASE_MEASURING_FWD) {
+        sampleBuffer = g_fwdSamples;
+        sampleCount = &g_fwdSampleCount;
+        *sampleCount = 0;  // Reset counter
+      } else if (g_currentPhase == PHASE_MEASURING_REV) {
+        sampleBuffer = g_revSamples;
+        sampleCount = &g_revSampleCount;
+        *sampleCount = 0;  // Reset counter
+      }
+
+      // Sample as fast as possible while motion is active
+      if (sampleBuffer != NULL && sampleCount != NULL) {
+        while (g_collectSamples && *sampleCount < maxSamples) {
+          if (scale.is_ready()) {
+            long raw = scale.read();
+            sampleBuffer[*sampleCount] = rawToPounds(raw);
+            (*sampleCount)++;
+          }
+          vTaskDelay(1);  // Yield briefly (~1ms)
+        }
+      }
+    } else {
+      vTaskDelay(10);  // Idle, check every 10ms
+    }
+  }
+}
+
+// Core 0: Request motion from Core 1 (wrapper function)
+bool requestMotion(MotionRequest req, uint32_t timeoutMs) {
+  // Send command to Core 1
+  if (xQueueSend(motionCommandQueue, &req, pdMS_TO_TICKS(100)) != pdTRUE) {
+    Serial.println("ERROR: Motion queue full");
+    return false;
+  }
+
+  // Wait for completion
+  if (xSemaphoreTake(motionCompleteSemaphore, pdMS_TO_TICKS(timeoutMs)) != pdTRUE) {
+    Serial.println("ERROR: Motion timeout");
+    return false;
+  }
+
+  return true;
+}
+
+// Core 0: High-level wrapper functions
+void homeToLimitSafe() {
+  MotionRequest req;
+  req.cmd = CMD_HOME;
+  req.steps = 0;
+  req.direction = false;
+  req.pulseUs = HOME_STEP_US;
+  req.phase = PHASE_HOMING;
+  requestMotion(req);
+}
+
+void moveStepsBlockingSafe(long steps, bool forward, int pulseUs) {
+  MotionRequest req;
+  req.cmd = CMD_MOVE;
+  req.steps = steps;
+  req.direction = forward;
+  req.pulseUs = pulseUs;
+  req.phase = PHASE_NONE;
+  requestMotion(req);
+}
+
+// ============================================================================
+
 void homeToLimit() {
   const uint32_t HOMING_TIMEOUT_MS = 20000; // 20 second timeout
 
@@ -525,80 +775,147 @@ RunResult runTest() {
   const long steps_measure = lround(SEG_MEASURE_IN * STEPS_PER_INCH);
   const long steps_trim    = lround(SEG_TRIM_IN    * STEPS_PER_INCH);
 
+  // Reset sample counters
+  g_fwdSampleCount = 0;
+  g_revSampleCount = 0;
+
+  // Homing
   oledHeader("Homing...");
   oled.display();
-  homeToLimit();
+  homeToLimitSafe();
 
+  // Lowering (no sampling)
   oledHeader("Running (forward)...");
   oled.println(F("Lowering..."));
   oled.display();
+  setLED(255, 150, 0);  // Yellow
 
-  g_motionActive = true;
-  stepperEnable(true);
+  MotionRequest req;
 
-  // Yellow during lowering phase
-  setLED(255, 150, 0);
-  moveStepsBlocking(steps_lower,  DIR_FORWARD, STEP_PULSE_US); // ignore
-  moveStepsBlocking(steps_noise,  DIR_FORWARD, STEP_PULSE_US); // (currently 0, settling handled by trim)
+  // Enable stepper
+  req.cmd = CMD_ENABLE;
+  requestMotion(req, 1000);
 
+  // Lower phase
+  req.cmd = CMD_MOVE;
+  req.steps = steps_lower + steps_noise;  // Combined lowering + noise segments
+  req.direction = DIR_FORWARD;
+  req.pulseUs = STEP_PULSE_US;
+  req.phase = PHASE_LOWERING;
+  requestMotion(req);
+
+  // Forward measurement pass
   oledHeader("Measuring (FWD)...");
   oled.display();
-  // Cyan during forward measurement (first 0.25" and last 0.25" are trim/settling)
-  setLED(0, 255, 255);
-  MeasureResult fwd = measureDuringMove(steps_measure, DIR_FORWARD, STEP_PULSE_US, steps_trim);
+  setLED(0, 255, 255);  // Cyan
 
-  const int END_PAUSE_MS = 600;
-  delay(END_PAUSE_MS);
+  req.cmd = CMD_MEASURE_MOVE;
+  req.steps = steps_measure;
+  req.direction = DIR_FORWARD;
+  req.pulseUs = STEP_PULSE_US;
+  req.phase = PHASE_MEASURING_FWD;
+  requestMotion(req);
 
+  // Pause between passes
+  delay(600);
+
+  // Reverse measurement pass
   oledHeader("Measuring (REV)...");
   oled.display();
-  // Magenta during reverse measurement (first 0.25" and last 0.25" are trim/settling)
-  setLED(255, 0, 255);
-  MeasureResult rev = measureDuringMove(steps_measure, !DIR_FORWARD, STEP_PULSE_US, steps_trim);
+  setLED(255, 0, 255);  // Magenta
 
+  req.cmd = CMD_MEASURE_MOVE;
+  req.steps = steps_measure;
+  req.direction = !DIR_FORWARD;
+  req.pulseUs = STEP_PULSE_US;
+  req.phase = PHASE_MEASURING_REV;
+  requestMotion(req);
+
+  // Return
   oledHeader("Returning...");
   oled.display();
-  // Yellow during return
-  setLED(255, 150, 0);
-  moveStepsBlocking(steps_noise,  !DIR_FORWARD, STEP_PULSE_US); // (currently 0, settling handled by trim)
-  moveStepsBlocking(steps_lower,  !DIR_FORWARD, STEP_PULSE_US); // ignore
+  setLED(255, 150, 0);  // Yellow
 
-  homeToLimit();
-  stepperEnable(false);
-  g_motionActive = false;
+  req.cmd = CMD_MOVE;
+  req.steps = steps_noise + steps_lower;  // Combined noise + lower segments
+  req.direction = !DIR_FORWARD;
+  req.pulseUs = STEP_PULSE_US;
+  req.phase = PHASE_RETURNING;
+  requestMotion(req);
 
-  // Debug output: show sample counts and percentile averages
-  Serial.print("Forward samples: ");
-  Serial.print(fwd.count);
-  Serial.print(", 85-95%ile avg: ");
-  Serial.println(fwd.avgLb, 4);
-  Serial.print("Reverse samples: ");
-  Serial.print(rev.count);
-  Serial.print(", 85-95%ile avg: ");
-  Serial.println(rev.avgLb, 4);
+  homeToLimitSafe();
 
-  // Sample-weighted average of percentile averages across the two passes
-  double weightedSum = fabs(fwd.avgLb) * (double)fwd.count + fabs(rev.avgLb) * (double)rev.count;
-  long   totalCount  = fwd.count + rev.count;
+  // Disable stepper
+  req.cmd = CMD_DISABLE;
+  requestMotion(req, 1000);
+
+  // ========== SERIAL REPORTING ==========
+  Serial.println("\n===== TEST COMPLETE =====");
+  Serial.print("Forward pass samples: ");
+  Serial.println(g_fwdSampleCount);
+  Serial.print("Reverse pass samples: ");
+  Serial.println(g_revSampleCount);
+  Serial.print("Total samples: ");
+  Serial.println(g_fwdSampleCount + g_revSampleCount);
+  Serial.println("========================\n");
+
+  // Calculate COF using collected samples (trim samples from start and end)
+  // Trim calculation: skip first and last trimSteps worth of samples
+  long trimSamplesPerSide = (g_fwdSampleCount * steps_trim) / steps_measure;
+  if (trimSamplesPerSide < 0) trimSamplesPerSide = 0;
+
+  // For forward samples: skip first and last trimSamplesPerSide samples
+  long fwdStartIdx = trimSamplesPerSide;
+  long fwdEndIdx = g_fwdSampleCount - trimSamplesPerSide;
+  if (fwdEndIdx <= fwdStartIdx) {
+    fwdStartIdx = 0;
+    fwdEndIdx = g_fwdSampleCount;
+  }
+  long fwdTrimmedCount = fwdEndIdx - fwdStartIdx;
+
+  // Create trimmed forward array
+  float* fwdTrimmed = g_fwdSamples + fwdStartIdx;
+
+  // For reverse samples: skip first and last trimSamplesPerSide samples
+  long revStartIdx = trimSamplesPerSide;
+  long revEndIdx = g_revSampleCount - trimSamplesPerSide;
+  if (revEndIdx <= revStartIdx) {
+    revStartIdx = 0;
+    revEndIdx = g_revSampleCount;
+  }
+  long revTrimmedCount = revEndIdx - revStartIdx;
+
+  // Create trimmed reverse array
+  float* revTrimmed = g_revSamples + revStartIdx;
+
+  double fwdAvg = calculatePercentileAverage(fwdTrimmed, fwdTrimmedCount);
+  double revAvg = calculatePercentileAverage(revTrimmed, revTrimmedCount);
+
+  Serial.print("Forward 85-95%ile avg (trimmed): ");
+  Serial.print(fwdAvg, 4);
+  Serial.println(" lb");
+  Serial.print("Reverse 85-95%ile avg (trimmed): ");
+  Serial.print(revAvg, 4);
+  Serial.println(" lb");
+
+  // Sample-weighted average
+  double weightedSum = fabs(fwdAvg) * (double)fwdTrimmedCount +
+                       fabs(revAvg) * (double)revTrimmedCount;
+  long totalCount = fwdTrimmedCount + revTrimmedCount;
   double avgLbTwoPass = (totalCount > 0) ? (weightedSum / (double)totalCount) : 0.0;
 
-  // Free allocated memory
-  if (fwd.samples) free(fwd.samples);
-  if (rev.samples) free(rev.samples);
+  float cof = (NORMAL_FORCE_LB > 0) ? (avgLbTwoPass / NORMAL_FORCE_LB) : 0.0f;
+
+  Serial.print("Final COF: ");
+  Serial.println(cof, 4);
+  Serial.println("========================\n");
 
   // Test complete - pulse green 3 times
   pulseLED(0, 255, 0, 3, 300);
 
-  RunResult rr{};
+  RunResult rr;
   rr.avgFrictionLb = (float)avgLbTwoPass;
-
-  if (NORMAL_FORCE_LB == 0.0f) {
-    Serial.println("ERROR: Division by zero - NORMAL_FORCE_LB is 0!");
-    rr.cof = 0.0f;
-  } else {
-    rr.cof = (float)(avgLbTwoPass / NORMAL_FORCE_LB);
-  }
-
+  rr.cof = cof;
   return rr;
 }
 
@@ -946,6 +1263,62 @@ void setup() {
   Serial.print(" counts/lb, Tare: ");
   Serial.println(g_tareRaw);
 
+  // ========== DUAL-CORE TASK INITIALIZATION ==========
+  Serial.println("\n=== Initializing Dual-Core Architecture ===");
+  Serial.print("setup() running on core: ");
+  Serial.println(xPortGetCoreID());
+
+  // Create inter-core communication
+  Serial.println("Creating motion command queue...");
+  motionCommandQueue = xQueueCreate(5, sizeof(MotionRequest));
+  if (motionCommandQueue == NULL) {
+    Serial.println("ERROR: Failed to create motion queue!");
+  }
+
+  Serial.println("Creating motion complete semaphore...");
+  motionCompleteSemaphore = xSemaphoreCreateBinary();
+  if (motionCompleteSemaphore == NULL) {
+    Serial.println("ERROR: Failed to create semaphore!");
+  }
+
+  Serial.println("Creating motion task on Core 1 (high priority)...");
+  BaseType_t motionTaskCreated = xTaskCreatePinnedToCore(
+    motionTask,           // Function
+    "Motion",             // Name
+    4096,                 // Stack size (bytes)
+    NULL,                 // Parameter
+    3,                    // Priority (high - above default 1)
+    NULL,                 // Task handle
+    1                     // Core 1
+  );
+
+  if (motionTaskCreated != pdPASS) {
+    Serial.println("ERROR: Failed to create motion task!");
+  } else {
+    Serial.println("Motion task created successfully");
+  }
+
+  Serial.println("Creating force sampling task on Core 0 (medium priority)...");
+  BaseType_t samplingTaskCreated = xTaskCreatePinnedToCore(
+    forceSamplingTask,
+    "ForceSample",
+    4096,
+    NULL,
+    2,                    // Priority (medium)
+    &forceSamplingTaskHandle,
+    0                     // Core 0
+  );
+
+  if (samplingTaskCreated != pdPASS) {
+    Serial.println("ERROR: Failed to create sampling task!");
+  } else {
+    Serial.println("Force sampling task created successfully");
+  }
+
+  delay(200);  // Let tasks initialize
+  Serial.println("=== Dual-Core Architecture Initialized ===\n");
+  // ====================================================
+
   showSplash();
   Serial.println("Starting rainbow cycle...");
   rainbowCycle(2000); // 2 second rainbow cycle on power-up
@@ -962,7 +1335,7 @@ void setup() {
     Serial.println("Not at limit, starting homing sequence...");
     oled.println(F("Homing..."));
     oled.display();
-    homeToLimit();
+    homeToLimitSafe();
     Serial.println("Homing complete");
     oled.println(F("Homed"));
     oled.display();

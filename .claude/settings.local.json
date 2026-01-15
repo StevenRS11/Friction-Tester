@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "WebFetch(domain:www.ti.com)"
+      "WebFetch(domain:www.ti.com)",
+      "Bash(nul)",
+      "Bash(findstr:*)",
+      "Bash(dir /B \"C:\\Users\\steve\\Documents\\Arduino\\libraries\" 2)",
+      "Bash(dir /B \"C:\\Users\\steve\\Documents\\Arduino\\libraries\\MFRC522_I2C\\src\" 2)",
+      "Bash(arduino-cli lib list:*)"
     ],
     "deny": [],
     "ask": []
