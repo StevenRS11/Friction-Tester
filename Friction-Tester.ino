@@ -59,8 +59,8 @@ const float SEG_NOISE_IN   = 0.0;  // (removed: settling now handled by SEG_TRIM
 const float SEG_MEASURE_IN = 3.0;  // total measurement segment (includes trim regions)
 const float SEG_TRIM_IN    = 0.25; // settle/trim at start and end (actual measurement: 2.5")
 
-const int    STEP_PULSE_US   = 300; // motion speed (lower = faster)how
-const int    HOME_STEP_US    = 600; // homing speed
+const int    STEP_PULSE_US   = 150; // motion speed (lower = faster)
+const int    HOME_STEP_US    = 300; // homing speed
 const int    BACKOFF_STEPS   = 600; // homing backoff
 const bool   DIR_FORWARD     = true;
 const bool   DIR_HOME_TOWARD_LIMIT = !DIR_FORWARD;
@@ -364,6 +364,31 @@ void tareNow() {
 }
 
 void doCalibration3lb() {
+  // ---- Move carriage to furthest position for calibration ----
+  oledHeader("CAL: Positioning...");
+  oled.println(F("Moving to cal position"));
+  oled.display();
+  setLED(255, 150, 0); // Yellow during positioning
+
+  // First home to ensure consistent starting point
+  homeToLimitSafe();
+
+  // Move to furthest position (lowering + measurement distance)
+  const long calPositionSteps = lround((SEG_LOWER_IN + SEG_MEASURE_IN) * STEPS_PER_INCH);
+
+  MotionRequest req;
+  req.cmd = CMD_ENABLE;
+  requestMotion(req, 1000);
+
+  req.cmd = CMD_MOVE;
+  req.steps = calPositionSteps;
+  req.direction = DIR_FORWARD;
+  req.pulseUs = STEP_PULSE_US;
+  req.phase = PHASE_NONE;
+  requestMotion(req);
+
+  ledOff();
+
   // ---- Step 1: Tare (zero-load) ----
   oledHeader("CAL: Step 1/2 (Tare)");
   oled.println(F("Remove all load"));
@@ -408,6 +433,15 @@ void doCalibration3lb() {
     oled.println(F("Signal too small"));
     oled.display();
     delay(2000);
+
+    // Return carriage to home even on failure
+    oledHeader("Returning...");
+    oled.display();
+    homeToLimitSafe();
+
+    MotionRequest reqDisable;
+    reqDisable.cmd = CMD_DISABLE;
+    requestMotion(reqDisable, 1000);
     return;
   }
 
@@ -422,6 +456,21 @@ void doCalibration3lb() {
   oledKV("TareRaw", String(g_tareRaw));
   oled.display();
   delay(1500);
+
+  // ---- Return carriage to home position ----
+  oledHeader("CAL: Returning...");
+  oled.println(F("Moving to home"));
+  oled.display();
+  setLED(255, 150, 0); // Yellow during return
+
+  homeToLimitSafe();
+
+  // Disable stepper
+  MotionRequest reqDisable;
+  reqDisable.cmd = CMD_DISABLE;
+  requestMotion(reqDisable, 1000);
+
+  ledOff();
 }
 
 // ----------------------------- Motion ---------------------------------------
@@ -441,7 +490,7 @@ void executePureMove(long steps, bool forward, int pulseUs) {
 
 // Core 1: Homing sequence (called from motion task)
 bool executeHome() {
-  const uint32_t HOMING_TIMEOUT_MS = 20000;
+  const uint32_t HOMING_TIMEOUT_MS = 100000; // 100 second timeout
 
   stepperEnable(true);
   setDir(DIR_HOME_TOWARD_LIMIT);
@@ -623,7 +672,7 @@ void moveStepsBlockingSafe(long steps, bool forward, int pulseUs) {
 // ============================================================================
 
 void homeToLimit() {
-  const uint32_t HOMING_TIMEOUT_MS = 20000; // 20 second timeout
+  const uint32_t HOMING_TIMEOUT_MS = 100000; // 100 second timeout
 
   g_motionActive = true;
   stepperEnable(true);
