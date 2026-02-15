@@ -94,116 +94,153 @@ Key constants in USER CONFIG section:
 
 ## Known Issues & Future Improvements
 
-### HIGH PRIORITY (Should be addressed before production use)
+### HIGH PRIORITY — Measurement Accuracy
 
-1. **Outdated Distance Comment**
+1. **~~Sample-Weighted Bidirectional Average~~ (FIXED)**
+   - Location: `runTest()`, COF calculation
+   - Issue: Used `(|fwd| × N_fwd + |rev| × N_rev) / (N_fwd + N_rev)` instead of equal-weight `(|fwd| + |rev|) / 2`. If forward and reverse sample counts differ, one direction dominates, allowing directional bias (cable drag, surface grain) to leak through — defeating the purpose of bidirectional testing.
+   - Fix: Changed to equal-weighted average: `COF = (fwdAvg + revAvg) / (2 × NORMAL_FORCE_LB)`
+
+2. **85th–95th Percentile Selection Overestimates Friction**
+   - Location: `calculatePercentileAverage()` (~line 687)
+   - Issue: Sorts samples by absolute value and averages only the 85th–95th percentile band. This systematically selects the high end of the force distribution, overestimating steady-state kinetic friction. A median or broader central percentile (e.g., 25th–75th) would be more representative of steady-state sliding force.
+   - Impact: COF values are biased upward relative to true kinetic friction
+   - Fix: Consider switching to median or IQR-based average
+
+3. **No Auto-Tare Before Test**
+   - Location: `runTest()` (~line 772)
+   - Issue: The test never calls `tareNow()`. The tare offset (`g_tareRaw`) is whatever was last manually set or loaded from NVS. Load cell drift (thermal, mechanical) between the last tare and the test maps directly into measured friction force. Since normal force is a hardcoded constant (not measured), drift does not cancel out.
+   - Impact: Thermal drift directly biases COF
+   - Fix: Add `tareNow()` call at the start of `runTest()`, before homing
+
+4. **Post-Hoc Trim Assumes Uniform Sample Spacing**
+   - Location: `runTest()` (~lines 864–889)
+   - Issue: In the dual-core path, `forceSamplingTask()` collects samples over the entire measurement move. Trimming is done afterward by index: `trimSamplesPerSide = (sampleCount × steps_trim) / steps_measure`. This assumes samples are evenly distributed in time. If HX711 data-ready rate fluctuates, the index-based trim won't correspond exactly to the physical 0.25" trim regions.
+   - Impact: Moderate — trim boundaries may be spatially inaccurate
+   - Fix: Timestamp each sample and trim by elapsed time, or accept the approximation
+
+5. **No Validation Both Passes Have Sufficient Data**
+   - Location: `runTest()` (~lines 868–905)
+   - Issue: If one direction yields 0 samples (e.g., HX711 hangs), the code still computes a result. With equal weighting this produces `(valid + 0) / 2`, halving the real COF. With very few samples (<10), the percentile filter falls back to a simple average with no outlier rejection.
+   - Impact: Silent bad result on hardware fault
+   - Fix: Require minimum sample count per pass (e.g., 20); abort and warn if not met
+
+6. **Outdated Distance Comment**
    - Location: Line ~45-46
    - Issue: Comment says "6.0 inches total" but actual is 5.5" (SEG_NOISE_IN=0)
    - Impact: Could confuse during mechanical setup
 
-2. **Trim Bounds Validation**
-   - Location: Line ~450 (runTest)
+7. **Trim Bounds Validation**
+   - Location: `runTest()`
    - Issue: No check if `SEG_TRIM_IN >= SEG_MEASURE_IN/2`
    - Impact: Could create zero or negative measurement window
    - Fix: Add validation in setup() or configuration section
 
-3. **MAX_SAMPLES Overflow**
-   - Location: Line ~410 (measureDuringMove)
+8. **MAX_SAMPLES Overflow**
+   - Location: `measureDuringMove()` and `forceSamplingTask()`
    - Issue: Hardcoded 2000 sample limit, silently drops samples if exceeded
    - Impact: Could lose data on slow motion or long segments
    - Fix: Dynamic allocation based on segment length or warning when limit reached
 
-4. **Memory Allocation Error Handling**
-   - Location: Line ~372 (calculatePercentileAverage)
+9. **Memory Allocation Error Handling**
+   - Location: `calculatePercentileAverage()`
    - Issue: Returns 0.0 on malloc failure (indistinguishable from actual zero reading)
    - Impact: Silent failure could produce invalid test results
    - Fix: Return error code or use -1.0f as error indicator
 
-5. **Hardcoded Display Text**
-   - Location: Line ~697
-   - Issue: "Assuming N = 3 lb" should use `NORMAL_FORCE_LB` dynamically
-   - Impact: Misleading display when NORMAL_FORCE_LB is changed
+10. **~10ms Sampling Start Latency**
+    - Location: `forceSamplingTask()` (~line 579)
+    - Issue: When idle, the sampling task sleeps for 10ms. When Core 1 begins a measurement move, up to 10ms of initial motion goes unsampled (~16 steps / 0.0016"). This falls within the trim region but makes the effective trim slightly asymmetric (longer at start than end).
+    - Impact: Low — within trim margin
+    - Fix: Reduce idle delay or use a semaphore to wake the sampling task immediately
 
-### MEDIUM PRIORITY (Code quality improvements)
+### MEDIUM PRIORITY — Code Quality
 
-6. **Function Name Mismatch**
-   - Location: Line ~268
-   - Issue: `doCalibration3lb()` doesn't use 3lb anymore
-   - Fix: Rename to `doCalibration()` or `doFullCalibration()`
+11. **Dead Code: `measureDuringMove()` Function**
+    - Location: ~line 732
+    - Issue: The old single-core measurement function is never called from `runTest()` after the dual-core refactor. It allocates its own sample buffer and does inline trimming — completely separate from the dual-core path.
+    - Impact: Confusing; someone could accidentally call the wrong path
+    - Fix: Remove or clearly mark as deprecated
 
-7. **String Heap Fragmentation**
-   - Location: Lines 285, 299, 312, 322
-   - Issue: Arduino `String` class causes heap fragmentation on embedded systems
-   - Impact: Could lead to crashes on long-running devices
-   - Fix: Use `snprintf()` with char buffers instead
+12. **No Tare Between Forward and Reverse Passes**
+    - Location: `runTest()` (~line 820)
+    - Issue: The 600ms pause between passes does not re-tare. If the load cell baseline drifts during the ~18-second forward pass, the reverse pass inherits that drift. A quick baseline reading during the pause could compensate.
+    - Impact: Moderate on sensitive load cells
+    - Fix: Read baseline during the 600ms pause and subtract from reverse samples
 
-8. **millis() Overflow**
-   - Location: Lines ~527, 548, debounce logic
-   - Issue: After 49.7 days, `millis()` wraps to 0
-   - Impact: Time difference calculations could fail
-   - Fix: Use proper overflow-safe subtraction: `(millis() - startTime)`
+13. **No Outlier Rejection in Tare**
+    - Location: `hxReadRawAvg()` (~line 342)
+    - Issue: All 20 tare samples are averaged equally. An electrical spike during tare biases the offset.
+    - Fix: Use median or trimmed-mean instead of simple average
 
-9. **No I2C/OLED Error Checking**
-   - Location: Line ~605 (setup)
-   - Issue: `oled.begin()` return value ignored
-   - Impact: Code continues even if display fails
-   - Fix: Check return value and halt or flag error
+14. **Function Name Mismatch**
+    - Location: `doCalibration3lb()`
+    - Issue: Doesn't use 3lb anymore — uses `CAL_WEIGHT_LB`
+    - Fix: Rename to `doCalibration()` or `doFullCalibration()`
 
-10. **No Calibration Validation**
-    - Location: Line ~246 (loadCalibration)
+15. **String Heap Fragmentation**
+    - Location: Various display and calibration functions
+    - Issue: Arduino `String` class causes heap fragmentation on embedded systems
+    - Impact: Could lead to crashes on long-running devices
+    - Fix: Use `snprintf()` with char buffers instead
+
+16. **millis() Overflow**
+    - Location: Debounce logic, homing timeouts
+    - Issue: After 49.7 days, `millis()` wraps to 0
+    - Impact: Time difference calculations could fail
+    - Fix: Use proper overflow-safe subtraction: `(millis() - startTime)`
+
+17. **No I2C/OLED Error Checking**
+    - Location: `setup()`
+    - Issue: `oled.begin()` return value ignored
+    - Impact: Code continues even if display fails
+    - Fix: Check return value and halt or flag error
+
+18. **No Calibration Validation**
+    - Location: `loadCalibration()`
     - Issue: Loads values without sanity checking
     - Impact: Corrupt NVS could cause nonsensical measurements
     - Fix: Validate range (e.g., 100-10000 counts/lb is reasonable)
 
-11. **NVS Flash Wear**
-    - Location: Lines ~234-238 (saveCalibration)
+19. **NVS Flash Wear**
+    - Location: `saveCalibration()`
     - Issue: Every tare writes to flash (~100K write cycle limit)
     - Impact: Could wear out flash over years of use
     - Fix: Implement write counter or only save on significant changes
 
-### LOW PRIORITY (Nice to have)
+### LOW PRIORITY — Nice to Have
 
-12. **Magic Numbers Throughout**
-    - Examples:
-      - `100` (line ~309 - calibration delta threshold)
-      - `600` (line ~474 - END_PAUSE_MS)
-      - `50` (line ~587 - LED brightness)
-      - `10` (line ~362 - percentile sample threshold)
+20. **Magic Numbers Throughout**
+    - Examples: `100` (calibration delta threshold), `600` (pause between passes), `50` (LED brightness), `10` (percentile sample threshold)
     - Fix: Convert to named constants
 
-13. **Global State Variables**
-    - Location: Lines ~76-85, 321
+21. **Global State Variables**
     - Issue: Makes testing difficult, potential interrupt issues
     - Fix: Consider encapsulating in state struct
 
-14. **Percentile Edge Case**
-    - Location: Lines ~387-388
-    - Issue: With exactly 10 samples, only 1 sample averaged
+22. **Percentile Edge Case**
+    - Issue: With exactly 10 samples, only 1 sample averaged in the 85th–95th band
     - Fix: Require minimum 20+ samples for valid percentile
 
-15. **Unused Variable**
-    - Location: Line ~77
+23. **Unused Variable**
     - Issue: `g_lastAvgLb` is set but never displayed
     - Fix: Display on results screen or remove
 
-16. **No Position Verification**
+24. **No Position Verification**
     - Issue: Assumes stepper never misses steps
-    - Impact: Accumulated errors if steps are lost
     - Fix: Consider adding encoder feedback
 
-17. **No Watchdog Timer**
+25. **No Watchdog Timer**
     - Issue: Long operations could hang without recovery
     - Fix: Implement ESP32 watchdog for critical sections
 
-18. **Inconsistent Memory Management**
-    - Location: measureDuringMove function
+26. **Inconsistent Memory Management**
+    - Location: `measureDuringMove()` (dead code)
     - Issue: Caller must remember to free allocated memory
-    - Impact: Easy to leak memory on error paths
-    - Fix: Consider RAII pattern or return struct by value
+    - Fix: Remove dead code, or use RAII pattern
 
-19. **Undocumented Sample Rate**
-    - Issue: Unknown HX711 samples/second
-    - Impact: Can't predict if 2000 samples is adequate
+27. **Undocumented Sample Rate**
+    - Issue: Unknown HX711 samples/second in actual operation
     - Fix: Document expected rates, add diagnostic output
 
 ## Recent Changes (v1.0)

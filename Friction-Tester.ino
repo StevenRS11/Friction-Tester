@@ -898,11 +898,22 @@ RunResult runTest() {
   Serial.print(revAvg, 4);
   Serial.println(" lb");
 
-  // Sample-weighted average
-  double weightedSum = fabs(fwdAvg) * (double)fwdTrimmedCount +
-                       fabs(revAvg) * (double)revTrimmedCount;
-  long totalCount = fwdTrimmedCount + revTrimmedCount;
-  double avgLbTwoPass = (totalCount > 0) ? (weightedSum / (double)totalCount) : 0.0;
+  // Equal-weighted bidirectional average (standard COF practice)
+  // Each direction gets 50% weight to cancel directional bias
+  // (cable drag, surface grain, tare offset, load cell bias)
+  double avgLbTwoPass;
+  if (fwdTrimmedCount > 0 && revTrimmedCount > 0) {
+    avgLbTwoPass = (fabs(fwdAvg) + fabs(revAvg)) / 2.0;
+  } else if (fwdTrimmedCount > 0) {
+    avgLbTwoPass = fabs(fwdAvg);
+    Serial.println("WARNING: No reverse samples — using forward only");
+  } else if (revTrimmedCount > 0) {
+    avgLbTwoPass = fabs(revAvg);
+    Serial.println("WARNING: No forward samples — using reverse only");
+  } else {
+    avgLbTwoPass = 0.0;
+    Serial.println("ERROR: No samples collected in either direction");
+  }
 
   float cof = (NORMAL_FORCE_LB > 0) ? (avgLbTwoPass / NORMAL_FORCE_LB) : 0.0f;
 
