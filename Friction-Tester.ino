@@ -211,6 +211,7 @@ void   displayRFIDSuccess();
 void   displayRFIDRetry(int attemptsLeft);
 void   displayRFIDFinalFailure();
 bool   writeToRFID(float cofValue);
+void   dumpTestDataCSV();
 
 // Dual-core function prototypes
 void   motionTask(void* parameter);
@@ -979,6 +980,25 @@ RunResult runTest() {
   return rr;
 }
 
+// ----------------------------- CSV Data Dump --------------------------------
+void dumpTestDataCSV() {
+  Serial.println("---CSV_START---");
+  Serial.println("pass,index,force_lb");
+  for (long i = 0; i < g_fwdSampleCount; i++) {
+    Serial.print("FWD,");
+    Serial.print(i);
+    Serial.print(",");
+    Serial.println(g_fwdSamples[i], 4);
+  }
+  for (long i = 0; i < g_revSampleCount; i++) {
+    Serial.print("REV,");
+    Serial.print(i);
+    Serial.print(",");
+    Serial.println(g_revSamples[i], 4);
+  }
+  Serial.println("---CSV_END---");
+}
+
 // ----------------------------- Buttons --------------------------------------
 bool readButton(Btn& b, bool& shortPress, bool& longPress) {
   shortPress = false;
@@ -1456,6 +1476,8 @@ void loop() {
 
         Serial.print("Test complete! COF: ");
         Serial.println(r.cof, 3);
+
+        dumpTestDataCSV();
 
         // Display results with "Present NFC tag..." message
         displayTestResults(r.cof, MACHINE_ID);
