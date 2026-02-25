@@ -136,8 +136,8 @@ Located in USER CONFIG section (lines 22-96):
 - RGB LED: GPIO48
 
 **Motion parameters:**
-- `STEP_PULSE_US = 300`: Motion speed (lower = faster)
-- `HOME_STEP_US = 600`: Homing speed (slower/safer)
+- `STEP_PULSE_US = 150`: Motion speed (lower = faster)
+- `HOME_STEP_US = 300`: Homing speed (slower/safer)
 - `BACKOFF_STEPS = 600`: Distance to back off from limit
 
 **Test geometry:**
