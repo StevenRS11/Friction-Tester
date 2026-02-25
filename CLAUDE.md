@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is an ESP32-S3-based Coefficient of Friction (COF) tester for paddle surfaces. The device uses a stepper motor to drag a test paddle across a surface while measuring friction force with a load cell. It performs bidirectional tests (forward and reverse passes) to calculate the average COF, then writes results to NFC tags via the PaddleDNA library.
+This is an ESP32-S3-based Coefficient of Friction (COF) tester for paddle surfaces. The device uses a stepper motor to drag a test surface across a stationary paddle while measuring friction force with a load cell. It performs bidirectional tests (forward and reverse passes) to calculate the average COF, then writes results to NFC tags via the PaddleDNA library.
 
 **Hardware Stack:**
 - ESP32-S3-ZERO microcontroller
@@ -80,7 +80,7 @@ The system uses a linear motion profile divided into segments:
 **Key calculations:**
 - `STEPS_PER_REV = 200 × 16 = 3200 steps`
 - `STEPS_PER_INCH = 3200 × (19/6) ≈ 10,133 steps/inch`
-- Motion speed: `STEP_PULSE_US = 300µs` (~1667 steps/sec)
+- Motion speed: `STEP_PULSE_US = 150µs` (~3333 steps/sec)
 
 ### Measurement & COF Calculation
 
@@ -89,9 +89,9 @@ The system uses a linear motion profile divided into segments:
 2. Discard top 5% (noise spikes)
 3. Average 85th-95th percentile range
 
-**Bidirectional sample-weighted average:**
+**Bidirectional equal-weighted average:**
 ```
-COF = (|fwd_avg| × fwd_samples + |rev_avg| × rev_samples) / (total_samples × NORMAL_FORCE_LB)
+COF = (|fwd_avg| + |rev_avg|) / (2 × NORMAL_FORCE_LB)
 ```
 
 ### NFC/RFID Integration
