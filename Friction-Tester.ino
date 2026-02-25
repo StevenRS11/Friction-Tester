@@ -18,6 +18,7 @@
 #include <Adafruit_NeoPixel.h>
 #include <PaddleDNA.h>
 #include <math.h>
+#include "CofCalculation.h"
 
 // ----------------------------- USER CONFIG ----------------------------------
 // NOTE: Pin assignments below match PCB schematic (ESP32-S3-ZERO)
@@ -172,12 +173,7 @@ struct Btn {
 Btn btnStart{BTN_START, true, 0, 0, false};
 Btn btnZero {BTN_ZERO,  true, 0, 0, false};
 
-struct RunResult { float avgFrictionLb; float cof; };
-struct MeasureResult {
-  float* samples;  // array of all samples
-  long count;      // number of samples
-  double avgLb;    // computed percentile average
-};
+struct RunResult { float avgFrictionLb; float cof; float avgBias; };
 
 // Prototypes
 void   stepperEnable(bool on);
@@ -195,9 +191,6 @@ void   tareNow();
 void   doCalibration3lb();
 void   homeToLimit();
 void   moveStepsBlocking(long steps, bool forward, int pulseUs);
-MeasureResult measureDuringMove(long steps, bool forward, int pulseUs, long trimSteps);
-double calculatePercentileAverage(float* samples, long count);
-int    compareFloats(const void* a, const void* b);
 RunResult runTest();
 bool   readButton(Btn& b, bool& shortPress, bool& longPress);
 void   updateLiveForceLine(bool forceClear=false);
@@ -723,107 +716,11 @@ void moveStepsBlocking(long steps, bool forward, int pulseUs) {
   for (long i=0; i<steps; i++) doStepBlocking(pulseUs);
 }
 
-// Comparison function for qsort
-int compareFloats(const void* a, const void* b) {
-  float fa = *(const float*)a;
-  float fb = *(const float*)b;
-  if (fa < fb) return -1;
-  if (fa > fb) return 1;
-  return 0;
-}
-
-// Calculate average of samples from 85th to 95th percentile
-// (disregard top 5%, average next 10%)
-double calculatePercentileAverage(float* samples, long count) {
-  if (count < 10) {
-    // Not enough samples for percentile calculation, just average all
-    double sum = 0.0;
-    for (long i = 0; i < count; i++) {
-      sum += fabs(samples[i]);
-    }
-    return sum / (double)count;
-  }
-
-  // Sort samples by absolute value (we need a temporary array for this)
-  float* absSamples = (float*)malloc(count * sizeof(float));
-  if (!absSamples) {
-    Serial.println("ERROR: Failed to allocate memory for sorting");
-    return 0.0;
-  }
-
-  for (long i = 0; i < count; i++) {
-    absSamples[i] = fabs(samples[i]);
-  }
-
-  qsort(absSamples, count, sizeof(float), compareFloats);
-
-  // Calculate indices for 85th and 95th percentiles
-  // Top 5% means we discard from 95th percentile to 100th
-  // We want 85th to 95th percentile
-  long idx85 = (long)(count * 0.85);
-  long idx95 = (long)(count * 0.95);
-
-  if (idx85 >= idx95) idx85 = idx95 - 1;
-  if (idx85 < 0) idx85 = 0;
-
-  // Average the samples in this range
-  double sum = 0.0;
-  long rangeCount = idx95 - idx85;
-  for (long i = idx85; i < idx95; i++) {
-    sum += absSamples[i];
-  }
-
-  free(absSamples);
-
-  return (rangeCount > 0) ? (sum / (double)rangeCount) : 0.0;
-}
-
-// Non-blocking measurement during motion
-MeasureResult measureDuringMove(long steps, bool forward, int pulseUs, long trimSteps) {
-  setDir(forward);
-
-  // Allocate array for samples (estimated max ~2000 samples per pass)
-  const long MAX_SAMPLES = 2000;
-  float* samples = (float*)malloc(MAX_SAMPLES * sizeof(float));
-  long nF = 0;
-
-  if (!samples) {
-    Serial.println("ERROR: Failed to allocate sample array");
-    MeasureResult mr;
-    mr.samples = NULL;
-    mr.count = 0;
-    mr.avgLb = 0.0;
-    return mr;
-  }
-
-  // Keep tight timing - no LED updates in this critical loop
-  for (long i = 0; i < steps; i++) {
-    doStepBlocking(pulseUs);        // keep motion timing tight
-
-    // Only collect samples in the measurement window (skip start and end trim regions)
-    bool inMeasurementWindow = (i >= trimSteps) && (i < (steps - trimSteps));
-
-    // Non-blocking HX711 read (only if data is ready and in measurement window)
-    if (inMeasurementWindow && scale.is_ready() && nF < MAX_SAMPLES) {
-      long raw = scale.read();
-      float lbs = rawToPounds(raw);
-      samples[nF] = lbs;
-      nF++;
-    }
-  }
-
-  MeasureResult mr;
-  mr.samples = samples;
-  mr.count = nF;
-  mr.avgLb = calculatePercentileAverage(samples, nF);
-  return mr;
-}
 
 RunResult runTest() {
   const long steps_lower   = lround(SEG_LOWER_IN   * STEPS_PER_INCH);
   const long steps_noise   = lround(SEG_NOISE_IN   * STEPS_PER_INCH);
   const long steps_measure = lround(SEG_MEASURE_IN * STEPS_PER_INCH);
-  const long steps_trim    = lround(SEG_TRIM_IN    * STEPS_PER_INCH);
 
   // Reset sample counters
   g_fwdSampleCount = 0;
@@ -909,79 +806,38 @@ RunResult runTest() {
   Serial.println(g_fwdSampleCount + g_revSampleCount);
   Serial.println("========================\n");
 
-  // Calculate COF using collected samples (trim samples from start and end)
-  // Trim calculation: skip first and last trimSteps worth of samples
-  long trimSamplesPerSide = (g_fwdSampleCount * steps_trim) / steps_measure;
-  if (trimSamplesPerSide < 0) trimSamplesPerSide = 0;
+  // Paired midpoint COF calculation (handles trim internally)
+  float trimFraction = SEG_TRIM_IN / SEG_MEASURE_IN;
+  CofResult cr = calculateCOF(g_fwdSamples, g_fwdSampleCount,
+                               g_revSamples, g_revSampleCount,
+                               NORMAL_FORCE_LB, trimFraction,
+                               avgPercentileBand);
 
-  // For forward samples: skip first and last trimSamplesPerSide samples
-  long fwdStartIdx = trimSamplesPerSide;
-  long fwdEndIdx = g_fwdSampleCount - trimSamplesPerSide;
-  if (fwdEndIdx <= fwdStartIdx) {
-    fwdStartIdx = 0;
-    fwdEndIdx = g_fwdSampleCount;
-  }
-  long fwdTrimmedCount = fwdEndIdx - fwdStartIdx;
-
-  // Create trimmed forward array
-  float* fwdTrimmed = g_fwdSamples + fwdStartIdx;
-
-  // For reverse samples: skip first and last trimSamplesPerSide samples
-  long revStartIdx = trimSamplesPerSide;
-  long revEndIdx = g_revSampleCount - trimSamplesPerSide;
-  if (revEndIdx <= revStartIdx) {
-    revStartIdx = 0;
-    revEndIdx = g_revSampleCount;
-  }
-  long revTrimmedCount = revEndIdx - revStartIdx;
-
-  // Create trimmed reverse array
-  float* revTrimmed = g_revSamples + revStartIdx;
-
-  double fwdAvg = calculatePercentileAverage(fwdTrimmed, fwdTrimmedCount);
-  double revAvg = calculatePercentileAverage(revTrimmed, revTrimmedCount);
-
-  Serial.print("Forward 85-95%ile avg (trimmed): ");
-  Serial.print(fwdAvg, 4);
+  Serial.print("Paired samples used: ");
+  Serial.println(cr.pairedCount);
+  Serial.print("Avg friction force:  ");
+  Serial.print(cr.avgForceLb, 4);
   Serial.println(" lb");
-  Serial.print("Reverse 85-95%ile avg (trimmed): ");
-  Serial.print(revAvg, 4);
+  Serial.print("Avg positional bias: ");
+  Serial.print(cr.avgBias, 4);
   Serial.println(" lb");
-
-  // Equal-weighted bidirectional average (standard COF practice)
-  // Each direction gets 50% weight to cancel directional bias
-  // (cable drag, surface grain, tare offset, load cell bias)
-  double avgLbTwoPass;
-  if (fwdTrimmedCount > 0 && revTrimmedCount > 0) {
-    avgLbTwoPass = (fabs(fwdAvg) + fabs(revAvg)) / 2.0;
-  } else if (fwdTrimmedCount > 0) {
-    avgLbTwoPass = fabs(fwdAvg);
-    Serial.println("WARNING: No reverse samples — using forward only");
-  } else if (revTrimmedCount > 0) {
-    avgLbTwoPass = fabs(revAvg);
-    Serial.println("WARNING: No forward samples — using reverse only");
-  } else {
-    avgLbTwoPass = 0.0;
-    Serial.println("ERROR: No samples collected in either direction");
-  }
-
-  float cof = (NORMAL_FORCE_LB > 0) ? (avgLbTwoPass / NORMAL_FORCE_LB) : 0.0f;
-
-  Serial.print("Final COF: ");
-  Serial.println(cof, 4);
+  Serial.print("Final COF:           ");
+  Serial.println(cr.cof, 4);
   Serial.println("========================\n");
 
   // Test complete - pulse green 3 times
   pulseLED(0, 255, 0, 3, 300);
 
   RunResult rr;
-  rr.avgFrictionLb = (float)avgLbTwoPass;
-  rr.cof = cof;
+  rr.avgFrictionLb = cr.avgForceLb;
+  rr.cof = cr.cof;
+  rr.avgBias = cr.avgBias;
   return rr;
 }
 
 // ----------------------------- CSV Data Dump --------------------------------
 void dumpTestDataCSV() {
+  // Raw samples (both passes, untrimmed)
   Serial.println("---CSV_START---");
   Serial.println("pass,index,force_lb");
   for (long i = 0; i < g_fwdSampleCount; i++) {
@@ -997,6 +853,12 @@ void dumpTestDataCSV() {
     Serial.println(g_revSamples[i], 4);
   }
   Serial.println("---CSV_END---");
+
+  // Paired data (position-matched, trimmed)
+  float trimFraction = SEG_TRIM_IN / SEG_MEASURE_IN;
+  dumpPairedDataCSV(g_fwdSamples, g_fwdSampleCount,
+                    g_revSamples, g_revSampleCount,
+                    trimFraction);
 }
 
 // ----------------------------- Buttons --------------------------------------
