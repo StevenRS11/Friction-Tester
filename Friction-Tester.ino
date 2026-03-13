@@ -1,9 +1,9 @@
 /*
-  ESP32 Paddle COF Tester (continuous bidirectional test, non-blocking HX711)
+  ESP32 Paddle COF Tester (continuous bidirectional test, NAU7802 load cell amp)
   - DRV8825 + NEMA17
-  - HX711 load cell amp
+  - NAU7802 load cell amp (I2C)
   - SSD1306 OLED (I2C)
-  - Buttons: START, ZERO/CAL -> INPUT_PULLUP, wire to GND (see BTN_START, BTN_ZERO defines)
+  - Button: START -> INPUT_PULLUP, wire to GND (see BTN_START define)
   - Limit switch -> INPUT_PULLUP, active-LOW, wire to GND (see PIN_LIMIT define)
   - Pin assignments vary by ESP32 variant - see USER CONFIG section below
   - On normal boot: homes to limit switch automatically if not already pressed
@@ -13,7 +13,7 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <HX711.h>
+#include <SparkFun_Qwiic_Scale_NAU7802_Arduino_Library.h>
 #include <Preferences.h>
 #include <Adafruit_NeoPixel.h>
 #include <PaddleDNA.h>
@@ -32,8 +32,8 @@
 #define OLED_HEIGHT  64
 #define OLED_ADDR    0x3C
 
-#define HX_DOUT  5    // HX711 load cell data
-#define HX_SCK   6    // HX711 load cell clock
+#define NAU_SDA  5   // NAU7802 I2C data (Wire1)
+#define NAU_SCL  6    // NAU7802 I2C clock (Wire1)
 
 #define PIN_STEP  7   // DRV8825 step pin
 #define PIN_DIR   2  // DRV8825 direction pin
@@ -43,7 +43,8 @@
 #define LIMIT_ACTIVE_LOW 1
 
 #define BTN_START  10 // Start button (active-LOW with 10K pullup)
-#define BTN_ZERO   9  // Zero/Calibration button (active-LOW with 10K pullup)
+                      // All functions on one button: press=run, hold=tare, boot+hold=calibrate
+                      // Hold 3s during motion/test/cal = abort
 
 #define RGB_LED_PIN 48   // Onboard RGB LED (ESP32-S3)
 
@@ -68,6 +69,7 @@ const bool   DIR_HOME_TOWARD_LIMIT = !DIR_FORWARD;
 
 const uint32_t DEBOUNCE_MS   = 30;
 const uint32_t LONG_PRESS_MS = 1200;
+const uint32_t ABORT_HOLD_MS = 3000;  // Hold START 3s during motion to abort
 
 const float CAL_WEIGHT_LB    = 3.883;   // calibration weight
 const float NORMAL_FORCE_LB  = 3.59;  // test normal force
@@ -97,7 +99,7 @@ const uint32_t FIXED_TIMESTAMP = 1768176000;
 // ----------------------------------------------------------------------------
 
 Adafruit_SSD1306 oled(OLED_WIDTH, OLED_HEIGHT, &Wire);
-HX711 scale;
+NAU7802 nau;
 Preferences prefs;
 Adafruit_NeoPixel rgbLed(1, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 
@@ -125,6 +127,7 @@ enum MotionPhase {
 enum MotionCommand {
   CMD_NONE,
   CMD_HOME,
+  CMD_HOME_FORCE,  // Home without abort checking (used after abort)
   CMD_MOVE,
   CMD_MEASURE_MOVE,
   CMD_ENABLE,
@@ -142,6 +145,8 @@ struct MotionRequest {
 // Global state (shared between cores)
 volatile MotionPhase g_currentPhase = PHASE_NONE;
 volatile bool g_collectSamples = false;  // Signal Core 0 to sample
+volatile bool g_abortRequested = false;  // Abort flag (set by Core 1 button check)
+volatile uint32_t g_abortBtnDownAt = 0;  // Tracks when abort button was first pressed
 
 // Sample storage (Core 0 writes, Core 1 never touches)
 #define MAX_SAMPLES_PER_PASS 2000
@@ -171,7 +176,6 @@ struct Btn {
   bool longSent;
 };
 Btn btnStart{BTN_START, true, 0, 0, false};
-Btn btnZero {BTN_ZERO,  true, 0, 0, false};
 
 struct RunResult { float avgFrictionLb; float cof; float avgBias; };
 
@@ -185,11 +189,14 @@ void   oledKV(const char* k, const String& v);
 void   showSplash();
 void   saveCalibration();
 void   loadCalibration();
-long   hxReadRawAvg(int n);
+long   nauReadRawAvg(int n);
 float  rawToPounds(long raw);
 void   tareNow();
 void   doCalibration3lb();
 void   homeToLimit();
+void   homeToLimitSafe();
+void   homeToLimitForce();
+bool   checkAbortButton();
 void   moveStepsBlocking(long steps, bool forward, int pulseUs);
 RunResult runTest();
 bool   readButton(Btn& b, bool& shortPress, bool& longPress);
@@ -254,7 +261,7 @@ void showSplash() {
   oled.setTextColor(SSD1306_WHITE);
   oled.setCursor(0, 0);
   oled.println(F("ESP32 Paddle COF Tester"));
-  oled.println(F("DRV8825 + HX711 + OLED"));
+  oled.println(F("DRV8825 + NAU7802 + OLED"));
   oled.display();
 }
 
@@ -333,11 +340,11 @@ void loadCalibration() {
   g_tareRaw = tare;
 }
 
-long hxReadRawAvg(int n) {
+long nauReadRawAvg(int n) {
   long sum = 0;
   for (int i=0; i<n; i++) {
-    while (!scale.is_ready()) delay(1);
-    sum += scale.read();
+    while (!nau.available()) delay(1);
+    sum += nau.getReading();
   }
   return sum / n;
 }
@@ -352,13 +359,16 @@ float rawToPounds(long raw) {
 
 void tareNow() {
   setLED(255, 0, 0); // Red during tare
-  g_tareRaw = hxReadRawAvg(HX_SAMPLES_TARE);
+  g_tareRaw = nauReadRawAvg(HX_SAMPLES_TARE);
   saveCalibration();
   ledOff();
 }
 
 void doCalibration3lb() {
   // ---- Move carriage to furthest position for calibration ----
+  g_abortRequested = false;
+  g_abortBtnDownAt = 0;
+
   oledHeader("CAL: Positioning...");
   oled.println(F("Moving to cal position"));
   oled.display();
@@ -367,6 +377,9 @@ void doCalibration3lb() {
   // First home to ensure consistent starting point
   homeToLimitSafe();
 
+  if (g_abortRequested) goto cal_abort;
+
+  {
   // Move to furthest position (lowering + measurement distance)
   const long calPositionSteps = lround((SEG_LOWER_IN + SEG_MEASURE_IN) * STEPS_PER_INCH);
 
@@ -380,6 +393,8 @@ void doCalibration3lb() {
   req.pulseUs = STEP_PULSE_US;
   req.phase = PHASE_NONE;
   requestMotion(req);
+
+  if (g_abortRequested) goto cal_abort;
 
   ledOff();
 
@@ -399,7 +414,7 @@ void doCalibration3lb() {
   oledHeader("CAL: Taring...");
   oled.display();
   setLED(255, 0, 0); // Red during tare
-  g_tareRaw = hxReadRawAvg(HX_SAMPLES_TARE);
+  g_tareRaw = nauReadRawAvg(HX_SAMPLES_TARE);
   ledOff();
 
   // ---- Step 2: Known weight ----
@@ -419,7 +434,7 @@ void doCalibration3lb() {
     delay(10);
   }
 
-  long raw3 = hxReadRawAvg(HX_SAMPLES_TARE);
+  long raw3 = nauReadRawAvg(HX_SAMPLES_TARE);
   long delta = raw3 - g_tareRaw; // counts due to calibration weight
 
   if (abs(delta) < 100) {
@@ -460,11 +475,39 @@ void doCalibration3lb() {
   homeToLimitSafe();
 
   // Disable stepper
-  MotionRequest reqDisable;
-  reqDisable.cmd = CMD_DISABLE;
-  requestMotion(reqDisable, 1000);
+  {
+    MotionRequest reqDisable;
+    reqDisable.cmd = CMD_DISABLE;
+    requestMotion(reqDisable, 1000);
+  }
 
   ledOff();
+  }  // end normal calibration block
+
+  return;
+
+cal_abort:
+  {
+    Serial.println("CALIBRATION ABORTED");
+    g_collectSamples = false;
+    g_abortRequested = false;
+    g_abortBtnDownAt = 0;
+    oledHeader("CAL ABORTED");
+    oled.println(F("Homing..."));
+    oled.display();
+    setLED(255, 0, 0);
+
+    while (digitalRead(BTN_START) == LOW) delay(10);
+
+    homeToLimitForce();
+
+    MotionRequest reqDis;
+    reqDis.cmd = CMD_DISABLE;
+    requestMotion(reqDis, 1000);
+
+    ledOff();
+    delay(1500);
+  }
 }
 
 // ----------------------------- Motion ---------------------------------------
@@ -472,27 +515,49 @@ bool g_motionActive = false; // used to suppress OLED live updates during motion
 
 // ==================== DUAL-CORE MOTION FUNCTIONS ============================
 
-// Core 1: Pure stepping function (NO HX711, NO I2C, NO Serial in critical loop)
+// Check if START button held for ABORT_HOLD_MS; returns true if abort triggered
+// Safe to call from any core (digitalRead only, no I2C)
+bool checkAbortButton() {
+  if (digitalRead(BTN_START) == LOW) {
+    if (g_abortBtnDownAt == 0) g_abortBtnDownAt = millis();
+    else if (millis() - g_abortBtnDownAt >= ABORT_HOLD_MS) {
+      g_abortRequested = true;
+      g_abortBtnDownAt = 0;
+      return true;
+    }
+  } else {
+    g_abortBtnDownAt = 0;
+  }
+  return false;
+}
+
+// Core 1: Pure stepping function (NO load cell, NO I2C, NO Serial in critical loop)
 void executePureMove(long steps, bool forward, int pulseUs) {
   setDir(forward);
 
   for (long i = 0; i < steps; i++) {
+    if ((i & 0x1FF) == 0 && checkAbortButton()) break;  // Check every ~512 steps
     doStepBlocking(pulseUs);
-    // That's it! Pure stepping only
   }
 }
 
 // Core 1: Homing sequence (called from motion task)
-bool executeHome() {
+// When abortable=true, checks for abort button during homing
+bool executeHome(bool abortable = true) {
   const uint32_t HOMING_TIMEOUT_MS = 100000; // 100 second timeout
 
   stepperEnable(true);
   setDir(DIR_HOME_TOWARD_LIMIT);
 
   // First approach
+  int stepCount = 0;
   uint32_t startTime = millis();
   while (!limitHit()) {
     if (millis() - startTime > HOMING_TIMEOUT_MS) {
+      stepperEnable(false);
+      return false;
+    }
+    if (abortable && (++stepCount & 0x1FF) == 0 && checkAbortButton()) {
       stepperEnable(false);
       return false;
     }
@@ -510,6 +575,10 @@ bool executeHome() {
   startTime = millis();
   while (!limitHit()) {
     if (millis() - startTime > HOMING_TIMEOUT_MS) {
+      stepperEnable(false);
+      return false;
+    }
+    if (abortable && (++stepCount & 0x1FF) == 0 && checkAbortButton()) {
       stepperEnable(false);
       return false;
     }
@@ -546,7 +615,12 @@ void motionTask(void* parameter) {
       switch (req.cmd) {
         case CMD_HOME:
           g_currentPhase = PHASE_HOMING;
-          executeHome();
+          executeHome(true);
+          break;
+
+        case CMD_HOME_FORCE:
+          g_currentPhase = PHASE_HOMING;
+          executeHome(false);
           break;
 
         case CMD_MOVE:
@@ -611,8 +685,8 @@ void forceSamplingTask(void* parameter) {
       // Sample as fast as possible while motion is active
       if (sampleBuffer != NULL && sampleCount != NULL) {
         while (g_collectSamples && *sampleCount < maxSamples) {
-          if (scale.is_ready()) {
-            long raw = scale.read();
+          if (nau.available()) {
+            long raw = nau.getReading();
             sampleBuffer[*sampleCount] = rawToPounds(raw);
             (*sampleCount)++;
           }
@@ -646,6 +720,17 @@ bool requestMotion(MotionRequest req, uint32_t timeoutMs) {
 void homeToLimitSafe() {
   MotionRequest req;
   req.cmd = CMD_HOME;
+  req.steps = 0;
+  req.direction = false;
+  req.pulseUs = HOME_STEP_US;
+  req.phase = PHASE_HOMING;
+  requestMotion(req);
+}
+
+// Home without abort checking (used after abort to ensure safe return)
+void homeToLimitForce() {
+  MotionRequest req;
+  req.cmd = CMD_HOME_FORCE;
   req.steps = 0;
   req.direction = false;
   req.pulseUs = HOME_STEP_US;
@@ -722,15 +807,20 @@ RunResult runTest() {
   const long steps_noise   = lround(SEG_NOISE_IN   * STEPS_PER_INCH);
   const long steps_measure = lround(SEG_MEASURE_IN * STEPS_PER_INCH);
 
-  // Reset sample counters
+  // Reset sample counters and abort state
   g_fwdSampleCount = 0;
   g_revSampleCount = 0;
+  g_abortRequested = false;
+  g_abortBtnDownAt = 0;
 
   // Homing
   oledHeader("Homing...");
   oled.display();
   homeToLimitSafe();
 
+  if (g_abortRequested) goto abort_cleanup;
+
+  {
   // Lowering (no sampling)
   oledHeader("Running (forward)...");
   oled.println(F("Lowering..."));
@@ -751,6 +841,8 @@ RunResult runTest() {
   req.phase = PHASE_LOWERING;
   requestMotion(req);
 
+  if (g_abortRequested) goto abort_cleanup;
+
   // Forward measurement pass
   oledHeader("Measuring (FWD)...");
   oled.display();
@@ -762,6 +854,8 @@ RunResult runTest() {
   req.pulseUs = STEP_PULSE_US;
   req.phase = PHASE_MEASURING_FWD;
   requestMotion(req);
+
+  if (g_abortRequested) goto abort_cleanup;
 
   // Pause between passes
   delay(600);
@@ -777,6 +871,8 @@ RunResult runTest() {
   req.pulseUs = STEP_PULSE_US;
   req.phase = PHASE_MEASURING_REV;
   requestMotion(req);
+
+  if (g_abortRequested) goto abort_cleanup;
 
   // Return
   oledHeader("Returning...");
@@ -795,7 +891,44 @@ RunResult runTest() {
   // Disable stepper
   req.cmd = CMD_DISABLE;
   requestMotion(req, 1000);
+  }
 
+  goto test_complete;  // Skip abort cleanup on normal path
+
+abort_cleanup:
+  {
+    Serial.println("TEST ABORTED - homing...");
+    g_collectSamples = false;
+    g_abortRequested = false;  // Clear so forced home proceeds
+    g_abortBtnDownAt = 0;
+    oledHeader("ABORTED");
+    oled.println(F("Homing..."));
+    oled.display();
+    setLED(255, 0, 0);  // Red
+
+    // Wait for button release before homing
+    while (digitalRead(BTN_START) == LOW) delay(10);
+
+    homeToLimitForce();
+
+    MotionRequest reqDis;
+    reqDis.cmd = CMD_DISABLE;
+    requestMotion(reqDis, 1000);
+
+    ledOff();
+    oledHeader("ABORTED");
+    oled.println(F("Test cancelled"));
+    oled.display();
+    delay(1500);
+
+    RunResult abortResult;
+    abortResult.avgFrictionLb = 0;
+    abortResult.cof = 0;
+    abortResult.avgBias = 0;
+    return abortResult;
+  }
+
+test_complete:
   // ========== SERIAL REPORTING ==========
   Serial.println("\n===== TEST COMPLETE =====");
   Serial.print("Forward pass samples: ");
@@ -1093,13 +1226,13 @@ bool writeToRFID(float cofValue) {
 unsigned long g_lastForceDrawMs = 0;
 void updateLiveForceLine(bool forceClear) {
   if (g_motionActive) return; // avoid OLED writes during motion
-  if (!scale.is_ready()) return;
+  if (!nau.available()) return;
 
   unsigned long now = millis();
   if (!forceClear && (now - g_lastForceDrawMs) < 1000) return; // 1 Hz
   g_lastForceDrawMs = now;
 
-  long raw = scale.read();
+  long raw = nau.getReading();
   float lbs = rawToPounds(raw);
 
   // Draw a single-line overlay at the bottom without clearing the whole screen
@@ -1124,7 +1257,6 @@ void setup() {
   pinMode(PIN_EN, OUTPUT);
   pinMode(PIN_LIMIT, INPUT_PULLUP); // active-LOW
   pinMode(BTN_START, INPUT_PULLUP); // active-LOW
-  pinMode(BTN_ZERO,  INPUT_PULLUP); // active-LOW
   Serial.println("GPIO pins configured");
 
   stepperEnable(false);
@@ -1197,8 +1329,22 @@ void setup() {
   accumulator = new PaddleDNA::MeasurementAccumulator(nfc, crypto, 9);
   Serial.println("MeasurementAccumulator created successfully");
 
-  Serial.println("Initializing HX711 load cell...");
-  scale.begin(HX_DOUT, HX_SCK);
+  Serial.println("Initializing NAU7802 load cell...");
+  Wire1.begin(NAU_SDA, NAU_SCL);
+  if (!nau.begin(Wire1)) {
+    Serial.println("ERROR: NAU7802 not detected!");
+    oled.clearDisplay();
+    oled.setCursor(0, 0);
+    oled.setTextSize(1);
+    oled.setTextColor(SSD1306_WHITE);
+    oled.println("NAU7802 NOT FOUND!");
+    oled.display();
+    pulseLED(255, 0, 0, 5, 300);
+    delay(3000);
+  }
+  nau.setGain(NAU7802_GAIN_128);
+  nau.setSampleRate(NAU7802_SPS_320);
+  nau.calibrateAFE();
   loadCalibration();
   Serial.print("Calibration loaded: ");
   Serial.print(g_calibration);
@@ -1290,6 +1436,19 @@ void setup() {
   }
 
   stepperEnable(false);
+
+  // Boot calibration: if START button is held during power-up, enter calibration
+  if (digitalRead(BTN_START) == LOW) {
+    Serial.println("START button held at boot - entering calibration mode");
+    oledHeader("Boot Calibration");
+    oled.println(F("Button held..."));
+    oled.display();
+    // Wait for release before starting calibration
+    while (digitalRead(BTN_START) == LOW) delay(10);
+    delay(200);
+    doCalibration3lb();
+  }
+
   Serial.println("=== Setup complete, entering main loop ===\n");
 }
 
@@ -1301,19 +1460,18 @@ void loop() {
   if (g_hasResult) {
     oledKV("Last COF",   String(g_lastCOF, 3));
   }
-  oled.println(F("Start=Run | Zero=Tar/Cal"));
+  oled.println(F("Press=Run | Hold=Tare"));
   oled.display();
 
   // keep updating live force once per second while idle
   g_motionActive = false;
   while (true) {
-    bool sp=false, lp=false, sz=false, lz=false;
+    bool sp=false, lp=false;
     readButton(btnStart, sp, lp);
-    readButton(btnZero,  sz, lz);
-    if (sp || lp || sz || lz) {
+    if (sp || lp) {
       updateLiveForceLine(true); // clear the overlay line before changing screen
-      if (sz) {
-        Serial.println("ZERO button short press - Taring...");
+      if (lp) {
+        Serial.println("START long press - Taring...");
         oledHeader("Taring..."); oled.display();
         tareNow();
         oledHeader("Tare Done");
@@ -1324,14 +1482,16 @@ void loop() {
         delay(600);
         break; // return to idle refresh loop
       }
-      if (lz) {
-        Serial.println("ZERO button long press - Starting calibration...");
-        doCalibration3lb();
-        break; // return to idle
-      }
       if (sp) {
         Serial.println("START button pressed - Running test...");
         RunResult r = runTest();
+
+        // Check if test was aborted (COF == 0)
+        if (r.cof == 0 && r.avgFrictionLb == 0) {
+          Serial.println("Test was aborted, returning to idle");
+          break;
+        }
+
         g_lastAvgLb = r.avgFrictionLb;
         g_lastCOF   = r.cof;
         g_hasResult = true;
@@ -1363,15 +1523,14 @@ void loop() {
         if (rfidSuccess) {
           oled.println(F("Data saved to tag"));
         }
-        oled.println(F("Press any button..."));
+        oled.println(F("Press button..."));
         oled.display();
 
-        // Wait here showing the result until any button input
+        // Wait here showing the result until button press
         while (true) {
-          bool a=false,b=false,c=false,d=false;
+          bool a=false, b=false;
           readButton(btnStart, a, b);
-          readButton(btnZero,  c, d);
-          if (a || b || c || d) break;
+          if (a || b) break;
           updateLiveForceLine();
           delay(10);
         }

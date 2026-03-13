@@ -9,12 +9,12 @@ This is an ESP32-S3-based Coefficient of Friction (COF) tester for paddle surfac
 **Hardware Stack:**
 - ESP32-S3-ZERO microcontroller
 - DRV8825 stepper driver with NEMA17 motor (1.8° steps, 1/16 microstepping)
-- HX711 load cell amplifier (24-bit ADC for force measurement)
+- NAU7802 load cell amplifier (24-bit ADC, I2C on Wire1)
 - SSD1306 OLED display (128x64, I2C)
 - PN532 NFC reader (I2C, shared bus with OLED)
 - Onboard RGB LED (WS2812/NeoPixel on GPIO48)
 - Limit switch for homing (GPIO4, active-LOW)
-- Two control buttons: START (GPIO10) and ZERO/CAL (GPIO9), both active-LOW with external 10K pullups
+- Single control button: START (GPIO10), active-LOW with external 10K pullup
 
 ## Build and Upload
 
@@ -33,7 +33,7 @@ arduino-cli monitor -p <PORT>
 - Adafruit_GFX
 - Adafruit_SSD1306
 - Adafruit_NeoPixel
-- HX711 (Bogdan Necula's library)
+- SparkFun Qwiic Scale NAU7802 Arduino Library
 - PaddleDNA (custom library for NFC measurement storage)
 
 ## Architecture
@@ -50,7 +50,7 @@ The system uses ESP32's dual-core capability to separate time-critical motion fr
 
 **Core 0 - Force Sampling Task** (`forceSamplingTask()`, priority 2):
 - Monitors `g_collectSamples` flag during measurement phases
-- Reads HX711 opportunistically via `scale.is_ready()` non-blocking checks
+- Reads NAU7802 opportunistically via `nau.available()` non-blocking checks
 - Stores samples in `g_fwdSamples[]` or `g_revSamples[]` based on current phase
 - Yields via `vTaskDelay(1)` to avoid starving other Core 0 tasks
 
@@ -116,12 +116,15 @@ Uses ESP32 Preferences (NVS) to persist:
 - `g_calibration`: counts per pound (float)
 - `g_tareRaw`: zero-load offset (long)
 
-**Calibration procedure (long-press ZERO button):**
-1. Tare: averages 20 HX711 readings with no load
+**Calibration procedure (hold START button during power-up/reset):**
+1. Tare: averages 20 NAU7802 readings with no load
 2. Known weight: user places calibration weight (`CAL_WEIGHT_LB`), system samples and calculates counts/lb
 
-**Quick tare (short-press ZERO button):**
+**Quick tare (long-press START button when idle):**
 Re-zeros without recalculating calibration factor.
+
+**Abort (hold START 3 seconds during motion/test/calibration):**
+Stops current operation, homes carriage, returns to idle.
 
 ## Key Configuration Constants
 
@@ -129,10 +132,10 @@ Located in USER CONFIG section (lines 22-96):
 
 **Pin assignments (ESP32-S3-ZERO):**
 - I2C: SDA=12, SCL=11 (shared: OLED + NFC)
-- HX711: DOUT=5, SCK=6
+- NAU7802 I2C (Wire1): SDA=6, SCL=5
 - Stepper: STEP=7, DIR=2, EN=3
 - Limit: GPIO4
-- Buttons: START=10, ZERO=9
+- Button: START=10
 - RGB LED: GPIO48
 
 **Motion parameters:**
