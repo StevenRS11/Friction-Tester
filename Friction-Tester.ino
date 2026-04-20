@@ -46,7 +46,7 @@
                       // All functions on one button: press=run, hold=tare, boot+hold=calibrate
                       // Hold 3s during motion/test/cal = abort
 
-#define RGB_LED_PIN 48   // Onboard RGB LED (ESP32-S3)
+#define RGB_LED_PIN 21   // Onboard RGB LED (ESP32-S3-Zero)
 
 const int   FULL_STEPS_PER_REV = 200;     // 1.8° motor
 const float MICROSTEP           = 16.0;   // 1/16 microstepping
@@ -1266,7 +1266,8 @@ void setup() {
   Serial.print("Initializing RGB LED on pin ");
   Serial.println(RGB_LED_PIN);
   rgbLed.begin();
-  rgbLed.setBrightness(50); // Not too bright
+  rgbLed.setBrightness(50);
+  rgbLed.show();
   Serial.println("RGB LED initialized, testing colors...");
 
   // Test LED with primary colors

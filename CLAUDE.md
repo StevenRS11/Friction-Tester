@@ -12,7 +12,7 @@ This is an ESP32-S3-based Coefficient of Friction (COF) tester for paddle surfac
 - NAU7802 load cell amplifier (24-bit ADC, I2C on Wire1)
 - SSD1306 OLED display (128x64, I2C)
 - PN532 NFC reader (I2C, shared bus with OLED)
-- Onboard RGB LED (WS2812/NeoPixel on GPIO48)
+- Onboard RGB LED (WS2812/NeoPixel on GPIO21)
 - Limit switch for homing (GPIO4, active-LOW)
 - Single control button: START (GPIO10), active-LOW with external 10K pullup
 
@@ -136,7 +136,7 @@ Located in USER CONFIG section (lines 22-96):
 - Stepper: STEP=7, DIR=2, EN=3
 - Limit: GPIO4
 - Button: START=10
-- RGB LED: GPIO48
+- RGB LED: GPIO21
 
 **Motion parameters:**
 - `STEP_PULSE_US = 150`: Motion speed (lower = faster)
