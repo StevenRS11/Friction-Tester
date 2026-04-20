@@ -71,8 +71,8 @@ const uint32_t DEBOUNCE_MS   = 30;
 const uint32_t LONG_PRESS_MS = 1200;
 const uint32_t ABORT_HOLD_MS = 3000;  // Hold START 3s during motion to abort
 
-const float CAL_WEIGHT_LB    = 3.883;   // calibration weight
-const float NORMAL_FORCE_LB  = 3.59;  // test normal force
+const float CAL_WEIGHT_LB    = 2.883;   // calibration weight
+const float NORMAL_FORCE_LB  = 2.59;  // test normal force
 const int HX_SAMPLES_TARE    = 20;      // averaging for tare
 const int HX_SAMPLES_MEAS    = 5;       // (unused by non-blocking read)
 
