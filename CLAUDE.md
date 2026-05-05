@@ -120,9 +120,6 @@ Uses ESP32 Preferences (NVS) to persist:
 1. Tare: averages 20 NAU7802 readings with no load
 2. Known weight: user places calibration weight (`CAL_WEIGHT_LB`), system samples and calculates counts/lb
 
-**Quick tare (long-press START button when idle):**
-Re-zeros without recalculating calibration factor.
-
 **Abort (hold START 3 seconds during motion/test/calibration):**
 Stops current operation, homes carriage, returns to idle.
 

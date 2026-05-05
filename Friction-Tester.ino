@@ -32,8 +32,8 @@
 #define OLED_HEIGHT  64
 #define OLED_ADDR    0x3C
 
-#define NAU_SDA  5   // NAU7802 I2C data (Wire1)
-#define NAU_SCL  6    // NAU7802 I2C clock (Wire1)
+#define NAU_SDA  6   // NAU7802 I2C data (Wire1)
+#define NAU_SCL  5    // NAU7802 I2C clock (Wire1)
 
 #define PIN_STEP  7   // DRV8825 step pin
 #define PIN_DIR   2  // DRV8825 direction pin
@@ -71,8 +71,8 @@ const uint32_t DEBOUNCE_MS   = 30;
 const uint32_t LONG_PRESS_MS = 1200;
 const uint32_t ABORT_HOLD_MS = 3000;  // Hold START 3s during motion to abort
 
-const float CAL_WEIGHT_LB    = 3.883;   // calibration weight
-const float NORMAL_FORCE_LB  = 3.59;  // test normal force
+const float CAL_WEIGHT_LB    = 2.883;   // calibration weight
+const float NORMAL_FORCE_LB  = 2.59;  // test normal force
 const int HX_SAMPLES_TARE    = 20;      // averaging for tare
 const int HX_SAMPLES_MEAS    = 5;       // (unused by non-blocking read)
 
@@ -191,7 +191,6 @@ void   saveCalibration();
 void   loadCalibration();
 long   nauReadRawAvg(int n);
 float  rawToPounds(long raw);
-void   tareNow();
 void   doCalibration3lb();
 void   homeToLimit();
 void   homeToLimitSafe();
@@ -243,10 +242,9 @@ void oledHeader(const char* line1) {
   oled.setTextSize(1);
   oled.setTextColor(SSD1306_WHITE);
   oled.setCursor(0, 0);
-  oled.println(F("ESP32 Paddle COF"));
+  oled.println(line1);
   oled.drawLine(0, 10, OLED_WIDTH, 10, SSD1306_WHITE);
   oled.setCursor(0, 14);
-  oled.println(line1);
 }
 
 void oledKV(const char* k, const String& v) {
@@ -257,11 +255,13 @@ void oledKV(const char* k, const String& v) {
 
 void showSplash() {
   oled.clearDisplay();
-  oled.setTextSize(1);
+  oled.setTextSize(2);
   oled.setTextColor(SSD1306_WHITE);
-  oled.setCursor(0, 0);
-  oled.println(F("ESP32 Paddle COF Tester"));
-  oled.println(F("DRV8825 + NAU7802 + OLED"));
+  // "Powering" ~96px @ size 2; center roughly
+  oled.setCursor(8, 16);
+  oled.println(F("Powering"));
+  oled.setCursor(28, 36);
+  oled.println(F("On..."));
   oled.display();
 }
 
@@ -355,13 +355,6 @@ float rawToPounds(long raw) {
     return 0.0f;
   }
   return (float)(raw - g_tareRaw) / g_calibration;
-}
-
-void tareNow() {
-  setLED(255, 0, 0); // Red during tare
-  g_tareRaw = nauReadRawAvg(HX_SAMPLES_TARE);
-  saveCalibration();
-  ledOff();
 }
 
 void doCalibration3lb() {
@@ -1042,6 +1035,10 @@ void displayTestResults(float cof, int machineID) {
   oled.setCursor(80, 30);
   oled.println("NFC");
 
+  // Bottom: skip hint
+  oled.setCursor(0, 56);
+  oled.println("hold button to skip");
+
   oled.display();
 }
 
@@ -1088,8 +1085,8 @@ void displayRFIDFinalFailure() {
   delay(3000);
 }
 
-// Write measurement to RFID tag with polling and retry
-// Returns: true if successful, false if aborted or failed after 5 retries
+// Write measurement to RFID tag - single 5-minute poll, no retry screens.
+// Returns: true on success, false on skip (button hold), tag-full, or timeout.
 bool writeToRFID(float cofValue) {
   Serial.println("Starting RFID write process...");
   Serial.print("COF value: ");
@@ -1103,120 +1100,84 @@ bool writeToRFID(float cofValue) {
     cofValue
   );
 
-  const int MAX_RETRIES = 5;
-  int attemptNumber = 0;
-  const unsigned long TAG_WAIT_TIMEOUT = 30000;  // 30 seconds per attempt
+  const unsigned long TAG_WAIT_TIMEOUT = 300000;  // 5 minutes
+  const unsigned long SKIP_HOLD_MS = 2000;
+  unsigned long startTime = millis();
+  unsigned long lastPollTime = 0;
+  bool ledState = false;
 
-  while (attemptNumber < MAX_RETRIES) {
-    unsigned long attemptStartTime = millis();
-    unsigned long lastPollTime = 0;
-
-    Serial.print("Attempt ");
-    Serial.print(attemptNumber + 1);
-    Serial.print(" of ");
-    Serial.println(MAX_RETRIES);
-
-    // Poll for tag until timeout or success/error
-    while (millis() - attemptStartTime < TAG_WAIT_TIMEOUT) {
-      // Check for abort (button hold 2+ seconds)
-      if (digitalRead(BTN_START) == LOW) {
-        unsigned long holdStart = millis();
-        while (digitalRead(BTN_START) == LOW && (millis() - holdStart < 2000)) {
-          delay(10);
-        }
-        if (millis() - holdStart >= 2000) {
-          // Abort
-          oled.clearDisplay();
-          oled.setTextSize(1);
-          oled.setTextColor(SSD1306_WHITE);
-          oled.setCursor(30, 24);
-          oled.println("Aborted");
-          oled.display();
-          setLED(255, 0, 0);
-          delay(1000);
-          ledOff();
-          return false;
-        }
-      }
-
-      // Poll for tag every 250ms
-      if (millis() - lastPollTime < 250) {
+  while (millis() - startTime < TAG_WAIT_TIMEOUT) {
+    // Skip if button held >= 2s
+    if (digitalRead(BTN_START) == LOW) {
+      unsigned long holdStart = millis();
+      while (digitalRead(BTN_START) == LOW && (millis() - holdStart < SKIP_HOLD_MS)) {
         delay(10);
-        continue;
       }
-      lastPollTime = millis();
-
-      // Blink LED during polling (blue)
-      static bool ledState = false;
-      if (ledState) {
-        setLED(0, 0, 255);
-      } else {
+      if (millis() - holdStart >= SKIP_HOLD_MS) {
         ledOff();
-      }
-      ledState = !ledState;
-
-      // Try to accumulate measurement
-      String msg;
-      PaddleDNA::AccumulateResult result = accumulator->accumulate(measurement, &msg);
-
-      Serial.print("Accumulate result: ");
-      Serial.print((int)result);
-      Serial.print(" - ");
-      Serial.println(msg);
-
-      switch (result) {
-        case PaddleDNA::AccumulateResult::Success:
-          ledOff();
-          displayRFIDSuccess();
-          return true;
-
-        case PaddleDNA::AccumulateResult::NoTag:
-          // Keep polling silently
-          break;
-
-        case PaddleDNA::AccumulateResult::TagFull:
-          ledOff();
-          oled.clearDisplay();
-          oled.setTextSize(1);
-          oled.setTextColor(SSD1306_WHITE);
-          oled.setCursor(15, 16);
-          oled.println("Tag is full!");
-          oled.setCursor(10, 32);
-          oled.println("Use a new tag");
-          oled.display();
-          pulseLED(255, 0, 0, 3, 300);
-          delay(3000);
-          return false;
-
-        case PaddleDNA::AccumulateResult::ReadError:
-        case PaddleDNA::AccumulateResult::WriteError:
-        case PaddleDNA::AccumulateResult::InvalidPayload:
-        case PaddleDNA::AccumulateResult::CryptoError:
-          // Error encountered - count as a failed attempt
-          ledOff();
-          attemptNumber++;
-
-          if (attemptNumber < MAX_RETRIES) {
-            // Show retry message
-            displayRFIDRetry(MAX_RETRIES - attemptNumber);
-          }
-          // Break out of polling loop to start next attempt
-          goto next_attempt;
+        oled.clearDisplay();
+        oled.setTextSize(1);
+        oled.setTextColor(SSD1306_WHITE);
+        oled.setCursor(36, 24);
+        oled.println("Skipped");
+        oled.display();
+        setLED(255, 150, 0);
+        delay(1000);
+        ledOff();
+        return false;
       }
     }
 
-    // If we get here, timeout occurred (no tag detected)
-    ledOff();
-    attemptNumber++;
-    if (attemptNumber < MAX_RETRIES) {
-      displayRFIDRetry(MAX_RETRIES - attemptNumber);
+    // Poll every 250ms
+    if (millis() - lastPollTime < 250) {
+      delay(10);
+      continue;
     }
+    lastPollTime = millis();
 
-    next_attempt:
-    continue;
+    // Blink blue while polling
+    ledState = !ledState;
+    if (ledState) setLED(0, 0, 255); else ledOff();
+
+    String msg;
+    PaddleDNA::AccumulateResult result = accumulator->accumulate(measurement, &msg);
+
+    Serial.print("Accumulate result: ");
+    Serial.print((int)result);
+    Serial.print(" - ");
+    Serial.println(msg);
+
+    switch (result) {
+      case PaddleDNA::AccumulateResult::Success:
+        ledOff();
+        displayRFIDSuccess();
+        return true;
+
+      case PaddleDNA::AccumulateResult::TagFull:
+        ledOff();
+        oled.clearDisplay();
+        oled.setTextSize(1);
+        oled.setTextColor(SSD1306_WHITE);
+        oled.setCursor(15, 16);
+        oled.println("Tag is full!");
+        oled.setCursor(10, 32);
+        oled.println("Use a new tag");
+        oled.display();
+        pulseLED(255, 0, 0, 3, 300);
+        delay(3000);
+        return false;
+
+      case PaddleDNA::AccumulateResult::NoTag:
+      case PaddleDNA::AccumulateResult::ReadError:
+      case PaddleDNA::AccumulateResult::WriteError:
+      case PaddleDNA::AccumulateResult::InvalidPayload:
+      case PaddleDNA::AccumulateResult::CryptoError:
+        // Keep polling silently - stay on the Present NFC screen
+        break;
+    }
   }
 
-  // All retries exhausted
+  // 5-minute timeout reached
   ledOff();
   displayRFIDFinalFailure();
   return false;
@@ -1352,6 +1313,14 @@ void setup() {
   Serial.print(" counts/lb, Tare: ");
   Serial.println(g_tareRaw);
 
+  // Auto-tare on boot. Doesn't affect COF (paired math cancels offset),
+  // but keeps the live force overlay honest after thermal/mechanical drift.
+  setLED(255, 0, 0);
+  g_tareRaw = nauReadRawAvg(HX_SAMPLES_TARE);
+  ledOff();
+  Serial.print("Auto-tare on boot: ");
+  Serial.println(g_tareRaw);
+
   // ========== DUAL-CORE TASK INITIALIZATION ==========
   Serial.println("\n=== Initializing Dual-Core Architecture ===");
   Serial.print("setup() running on core: ");
@@ -1414,26 +1383,14 @@ void setup() {
   Serial.println("Rainbow cycle complete");
   delay(500);
 
-  // Initialization homing sequence
+  // Initialization homing sequence (keep "Powering On..." splash on screen)
   Serial.println("Checking limit switch...");
-  oledHeader("Initializing...");
-  oled.println(F("Checking limit..."));
-  oled.display();
-
   if (!limitHit()) {
     Serial.println("Not at limit, starting homing sequence...");
-    oled.println(F("Homing..."));
-    oled.display();
     homeToLimitSafe();
     Serial.println("Homing complete");
-    oled.println(F("Homed"));
-    oled.display();
-    delay(400);
   } else {
     Serial.println("Already at home position");
-    oled.println(F("Already at home"));
-    oled.display();
-    delay(400);
   }
 
   stepperEnable(false);
@@ -1457,88 +1414,80 @@ void loop() {
   // Idle screen
   Serial.println("Entering idle state");
   ledOff(); // Turn off LED during idle
-  oledHeader("Idle");
+  oled.clearDisplay();
+  oled.setTextColor(SSD1306_WHITE);
+  // "Paddle COF" = 10 chars * 12px = 120px @ size 2; center in 128px
+  oled.setTextSize(2);
+  oled.setCursor(4, 12);
+  oled.print(F("Paddle COF"));
+  // "press button to start" = 21 chars * 6px = 126px @ size 1
+  oled.setTextSize(1);
+  oled.setCursor(1, 36);
+  oled.print(F("press button to start"));
   if (g_hasResult) {
-    oledKV("Last COF",   String(g_lastCOF, 3));
+    oled.setCursor(0, 54);
+    oled.print(F("Last: "));
+    oled.print(String(g_lastCOF, 3));
   }
-  oled.println(F("Press=Run | Hold=Tare"));
   oled.display();
 
-  // keep updating live force once per second while idle
   g_motionActive = false;
   while (true) {
     bool sp=false, lp=false;
     readButton(btnStart, sp, lp);
-    if (sp || lp) {
-      updateLiveForceLine(true); // clear the overlay line before changing screen
-      if (lp) {
-        Serial.println("START long press - Taring...");
-        oledHeader("Taring..."); oled.display();
-        tareNow();
-        oledHeader("Tare Done");
-        oledKV("TareRaw", String(g_tareRaw));
-        if (g_hasResult) { oledKV("Last COF", String(g_lastCOF, 3)); }
-        oled.display();
-        Serial.println("Tare complete");
-        delay(600);
-        break; // return to idle refresh loop
+    if (sp) {
+      Serial.println("START button pressed - Running test...");
+      RunResult r = runTest();
+
+      // Check if test was aborted (COF == 0)
+      if (r.cof == 0 && r.avgFrictionLb == 0) {
+        Serial.println("Test was aborted, returning to idle");
+        break;
       }
-      if (sp) {
-        Serial.println("START button pressed - Running test...");
-        RunResult r = runTest();
 
-        // Check if test was aborted (COF == 0)
-        if (r.cof == 0 && r.avgFrictionLb == 0) {
-          Serial.println("Test was aborted, returning to idle");
-          break;
-        }
+      g_lastAvgLb = r.avgFrictionLb;
+      g_lastCOF   = r.cof;
+      g_hasResult = true;
 
-        g_lastAvgLb = r.avgFrictionLb;
-        g_lastCOF   = r.cof;
-        g_hasResult = true;
+      Serial.print("Test complete! COF: ");
+      Serial.println(r.cof, 3);
 
-        Serial.print("Test complete! COF: ");
-        Serial.println(r.cof, 3);
+      dumpTestDataCSV();
 
-        dumpTestDataCSV();
+      // Display results with "Present NFC tag..." message
+      displayTestResults(r.cof, MACHINE_ID);
 
-        // Display results with "Present NFC tag..." message
-        displayTestResults(r.cof, MACHINE_ID);
+      // Write to RFID tag (with retry and abort handling)
+      Serial.println("Entering RFID write mode...");
+      bool rfidSuccess = writeToRFID(r.cof);
 
-        // Write to RFID tag (with retry and abort handling)
-        Serial.println("Entering RFID write mode...");
-        bool rfidSuccess = writeToRFID(r.cof);
-
-        if (rfidSuccess) {
-          Serial.println("RFID write successful");
-        } else {
-          Serial.println("RFID write failed or aborted");
-        }
-
-        // Show final result screen
-        oledHeader("Result");
-        oledKV("COF", String(r.cof, 3));
-        oled.print(F("N = "));
-        oled.print(NORMAL_FORCE_LB, 2);
-        oled.println(F(" lb"));
-        if (rfidSuccess) {
-          oled.println(F("Data saved to tag"));
-        }
-        oled.println(F("Press button..."));
-        oled.display();
-
-        // Wait here showing the result until button press
-        while (true) {
-          bool a=false, b=false;
-          readButton(btnStart, a, b);
-          if (a || b) break;
-          updateLiveForceLine();
-          delay(10);
-        }
-        break; // back to idle
+      if (rfidSuccess) {
+        Serial.println("RFID write successful");
+      } else {
+        Serial.println("RFID write failed or aborted");
       }
+
+      // Show final result screen
+      oledHeader("Result");
+      oledKV("COF", String(r.cof, 3));
+      oled.print(F("N = "));
+      oled.print(NORMAL_FORCE_LB, 2);
+      oled.println(F(" lb"));
+      if (rfidSuccess) {
+        oled.println(F("Data saved to tag"));
+      }
+      oled.println(F("Press button..."));
+      oled.display();
+
+      // Wait here showing the result until button press
+      while (true) {
+        bool a=false, b=false;
+        readButton(btnStart, a, b);
+        if (a || b) break;
+        delay(10);
+      }
+      break; // back to idle
     }
-    updateLiveForceLine();
     delay(10);
   }
 }
