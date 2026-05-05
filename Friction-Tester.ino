@@ -256,11 +256,13 @@ void oledKV(const char* k, const String& v) {
 
 void showSplash() {
   oled.clearDisplay();
-  oled.setTextSize(1);
+  oled.setTextSize(2);
   oled.setTextColor(SSD1306_WHITE);
-  oled.setCursor(0, 0);
-  oled.println(F("ESP32 Paddle COF Tester"));
-  oled.println(F("DRV8825 + NAU7802 + OLED"));
+  // "Powering" ~96px @ size 2; center roughly
+  oled.setCursor(8, 16);
+  oled.println(F("Powering"));
+  oled.setCursor(28, 36);
+  oled.println(F("On..."));
   oled.display();
 }
 
@@ -1414,26 +1416,14 @@ void setup() {
   Serial.println("Rainbow cycle complete");
   delay(500);
 
-  // Initialization homing sequence
+  // Initialization homing sequence (keep "Powering On..." splash on screen)
   Serial.println("Checking limit switch...");
-  oledHeader("Initializing...");
-  oled.println(F("Checking limit..."));
-  oled.display();
-
   if (!limitHit()) {
     Serial.println("Not at limit, starting homing sequence...");
-    oled.println(F("Homing..."));
-    oled.display();
     homeToLimitSafe();
     Serial.println("Homing complete");
-    oled.println(F("Homed"));
-    oled.display();
-    delay(400);
   } else {
     Serial.println("Already at home position");
-    oled.println(F("Already at home"));
-    oled.display();
-    delay(400);
   }
 
   stepperEnable(false);
@@ -1457,20 +1447,26 @@ void loop() {
   // Idle screen
   Serial.println("Entering idle state");
   ledOff(); // Turn off LED during idle
-  oledHeader("Idle");
+  oled.clearDisplay();
+  oled.setTextSize(2);
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setCursor(16, 8);
+  oled.println(F("Paddle"));
+  oled.setCursor(40, 30);
+  oled.println(F("COF"));
+  oled.setTextSize(1);
   if (g_hasResult) {
-    oledKV("Last COF",   String(g_lastCOF, 3));
+    oled.setCursor(0, 54);
+    oled.print(F("Last: "));
+    oled.print(String(g_lastCOF, 3));
   }
-  oled.println(F("Press=Run"));
   oled.display();
 
-  // keep updating live force once per second while idle
   g_motionActive = false;
   while (true) {
     bool sp=false, lp=false;
     readButton(btnStart, sp, lp);
     if (sp) {
-      updateLiveForceLine(true); // clear the overlay line before changing screen
       Serial.println("START button pressed - Running test...");
       RunResult r = runTest();
 
@@ -1519,12 +1515,10 @@ void loop() {
         bool a=false, b=false;
         readButton(btnStart, a, b);
         if (a || b) break;
-        updateLiveForceLine();
         delay(10);
       }
       break; // back to idle
     }
-    updateLiveForceLine();
     delay(10);
   }
 }
