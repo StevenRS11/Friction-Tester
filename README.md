@@ -107,11 +107,8 @@ Key constants in USER CONFIG section:
    - Impact: COF values are biased upward relative to true kinetic friction
    - Fix: Consider switching to median or IQR-based average
 
-3. **No Auto-Tare Before Test**
-   - Location: `runTest()` (~line 772)
-   - Issue: The test never calls `tareNow()`. The tare offset (`g_tareRaw`) is whatever was last manually set or loaded from NVS. Load cell drift (thermal, mechanical) between the last tare and the test maps directly into measured friction force. Since normal force is a hardcoded constant (not measured), drift does not cancel out.
-   - Impact: Thermal drift directly biases COF
-   - Fix: Add `tareNow()` call at the start of `runTest()`, before homing
+3. **~~No Auto-Tare Before Test~~ (NOT AN ISSUE)**
+   - The COF math (`CofCalculation.cpp`, `fabsf(fwd - rev) / 2`) pairs forward and reverse samples by position and subtracts. Any constant offset present in both passes — including a stale or drifted tare — cancels algebraically. Auto-taring before each test is therefore unnecessary; tare only affects the live force overlay shown on the idle OLED.
 
 4. **Post-Hoc Trim Assumes Uniform Sample Spacing**
    - Location: `runTest()` (~lines 864–889)

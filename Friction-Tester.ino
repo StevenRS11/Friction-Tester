@@ -32,8 +32,8 @@
 #define OLED_HEIGHT  64
 #define OLED_ADDR    0x3C
 
-#define NAU_SDA  5   // NAU7802 I2C data (Wire1)
-#define NAU_SCL  6    // NAU7802 I2C clock (Wire1)
+#define NAU_SDA  6   // NAU7802 I2C data (Wire1)
+#define NAU_SCL  5    // NAU7802 I2C clock (Wire1)
 
 #define PIN_STEP  7   // DRV8825 step pin
 #define PIN_DIR   2  // DRV8825 direction pin
@@ -191,7 +191,6 @@ void   saveCalibration();
 void   loadCalibration();
 long   nauReadRawAvg(int n);
 float  rawToPounds(long raw);
-void   tareNow();
 void   doCalibration3lb();
 void   homeToLimit();
 void   homeToLimitSafe();
@@ -355,13 +354,6 @@ float rawToPounds(long raw) {
     return 0.0f;
   }
   return (float)(raw - g_tareRaw) / g_calibration;
-}
-
-void tareNow() {
-  setLED(255, 0, 0); // Red during tare
-  g_tareRaw = nauReadRawAvg(HX_SAMPLES_TARE);
-  saveCalibration();
-  ledOff();
 }
 
 void doCalibration3lb() {
@@ -1352,6 +1344,14 @@ void setup() {
   Serial.print(" counts/lb, Tare: ");
   Serial.println(g_tareRaw);
 
+  // Auto-tare on boot. Doesn't affect COF (paired math cancels offset),
+  // but keeps the live force overlay honest after thermal/mechanical drift.
+  setLED(255, 0, 0);
+  g_tareRaw = nauReadRawAvg(HX_SAMPLES_TARE);
+  ledOff();
+  Serial.print("Auto-tare on boot: ");
+  Serial.println(g_tareRaw);
+
   // ========== DUAL-CORE TASK INITIALIZATION ==========
   Serial.println("\n=== Initializing Dual-Core Architecture ===");
   Serial.print("setup() running on core: ");
@@ -1461,7 +1461,7 @@ void loop() {
   if (g_hasResult) {
     oledKV("Last COF",   String(g_lastCOF, 3));
   }
-  oled.println(F("Press=Run | Hold=Tare"));
+  oled.println(F("Press=Run"));
   oled.display();
 
   // keep updating live force once per second while idle
@@ -1469,74 +1469,60 @@ void loop() {
   while (true) {
     bool sp=false, lp=false;
     readButton(btnStart, sp, lp);
-    if (sp || lp) {
+    if (sp) {
       updateLiveForceLine(true); // clear the overlay line before changing screen
-      if (lp) {
-        Serial.println("START long press - Taring...");
-        oledHeader("Taring..."); oled.display();
-        tareNow();
-        oledHeader("Tare Done");
-        oledKV("TareRaw", String(g_tareRaw));
-        if (g_hasResult) { oledKV("Last COF", String(g_lastCOF, 3)); }
-        oled.display();
-        Serial.println("Tare complete");
-        delay(600);
-        break; // return to idle refresh loop
+      Serial.println("START button pressed - Running test...");
+      RunResult r = runTest();
+
+      // Check if test was aborted (COF == 0)
+      if (r.cof == 0 && r.avgFrictionLb == 0) {
+        Serial.println("Test was aborted, returning to idle");
+        break;
       }
-      if (sp) {
-        Serial.println("START button pressed - Running test...");
-        RunResult r = runTest();
 
-        // Check if test was aborted (COF == 0)
-        if (r.cof == 0 && r.avgFrictionLb == 0) {
-          Serial.println("Test was aborted, returning to idle");
-          break;
-        }
+      g_lastAvgLb = r.avgFrictionLb;
+      g_lastCOF   = r.cof;
+      g_hasResult = true;
 
-        g_lastAvgLb = r.avgFrictionLb;
-        g_lastCOF   = r.cof;
-        g_hasResult = true;
+      Serial.print("Test complete! COF: ");
+      Serial.println(r.cof, 3);
 
-        Serial.print("Test complete! COF: ");
-        Serial.println(r.cof, 3);
+      dumpTestDataCSV();
 
-        dumpTestDataCSV();
+      // Display results with "Present NFC tag..." message
+      displayTestResults(r.cof, MACHINE_ID);
 
-        // Display results with "Present NFC tag..." message
-        displayTestResults(r.cof, MACHINE_ID);
+      // Write to RFID tag (with retry and abort handling)
+      Serial.println("Entering RFID write mode...");
+      bool rfidSuccess = writeToRFID(r.cof);
 
-        // Write to RFID tag (with retry and abort handling)
-        Serial.println("Entering RFID write mode...");
-        bool rfidSuccess = writeToRFID(r.cof);
-
-        if (rfidSuccess) {
-          Serial.println("RFID write successful");
-        } else {
-          Serial.println("RFID write failed or aborted");
-        }
-
-        // Show final result screen
-        oledHeader("Result");
-        oledKV("COF", String(r.cof, 3));
-        oled.print(F("N = "));
-        oled.print(NORMAL_FORCE_LB, 2);
-        oled.println(F(" lb"));
-        if (rfidSuccess) {
-          oled.println(F("Data saved to tag"));
-        }
-        oled.println(F("Press button..."));
-        oled.display();
-
-        // Wait here showing the result until button press
-        while (true) {
-          bool a=false, b=false;
-          readButton(btnStart, a, b);
-          if (a || b) break;
-          updateLiveForceLine();
-          delay(10);
-        }
-        break; // back to idle
+      if (rfidSuccess) {
+        Serial.println("RFID write successful");
+      } else {
+        Serial.println("RFID write failed or aborted");
       }
+
+      // Show final result screen
+      oledHeader("Result");
+      oledKV("COF", String(r.cof, 3));
+      oled.print(F("N = "));
+      oled.print(NORMAL_FORCE_LB, 2);
+      oled.println(F(" lb"));
+      if (rfidSuccess) {
+        oled.println(F("Data saved to tag"));
+      }
+      oled.println(F("Press button..."));
+      oled.display();
+
+      // Wait here showing the result until button press
+      while (true) {
+        bool a=false, b=false;
+        readButton(btnStart, a, b);
+        if (a || b) break;
+        updateLiveForceLine();
+        delay(10);
+      }
+      break; // back to idle
     }
     updateLiveForceLine();
     delay(10);
