@@ -1423,7 +1423,7 @@ void loop() {
   // "press button to start" = 21 chars * 6px = 126px @ size 1
   oled.setTextSize(1);
   oled.setCursor(1, 36);
-  oled.print(F("press button to start"));
+  oled.print(F("press button to test paddle"));
   if (g_hasResult) {
     oled.setCursor(0, 54);
     oled.print(F("Last: "));
