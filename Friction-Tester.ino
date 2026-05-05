@@ -1426,7 +1426,7 @@ void loop() {
   oled.print(F("press button to test paddle"));
   if (g_hasResult) {
     oled.setCursor(0, 54);
-    oled.print(F("Last: "));
+    oled.print(F("Last test: "));
     oled.print(String(g_lastCOF, 3));
   }
   oled.display();
@@ -1467,25 +1467,6 @@ void loop() {
         Serial.println("RFID write failed or aborted");
       }
 
-      // Show final result screen
-      oledHeader("Result");
-      oledKV("COF", String(r.cof, 3));
-      oled.print(F("N = "));
-      oled.print(NORMAL_FORCE_LB, 2);
-      oled.println(F(" lb"));
-      if (rfidSuccess) {
-        oled.println(F("Data saved to tag"));
-      }
-      oled.println(F("Press button..."));
-      oled.display();
-
-      // Wait here showing the result until button press
-      while (true) {
-        bool a=false, b=false;
-        readButton(btnStart, a, b);
-        if (a || b) break;
-        delay(10);
-      }
       break; // back to idle
     }
     delay(10);
