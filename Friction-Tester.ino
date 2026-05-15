@@ -32,8 +32,8 @@
 #define OLED_HEIGHT  64
 #define OLED_ADDR    0x3C
 
-#define NAU_SDA  6   // NAU7802 I2C data (Wire1)
-#define NAU_SCL  5    // NAU7802 I2C clock (Wire1)
+#define NAU_SDA  5   // NAU7802 I2C data (Wire1)
+#define NAU_SCL  6    // NAU7802 I2C clock (Wire1)
 
 #define PIN_STEP  7   // DRV8825 step pin
 #define PIN_DIR   2  // DRV8825 direction pin
@@ -161,6 +161,46 @@ SemaphoreHandle_t motionCompleteSemaphore = NULL;
 TaskHandle_t forceSamplingTaskHandle = NULL;
 // ============================================================================
 
+// =============================== UI STATE ===================================
+// Single-button device, mono 128x64 OLED. Layout grid:
+//   header  y=0..11   (machine id + status pill)
+//   body    y=12..51  (40px primary content)
+//   footer  y=52..63  (button-hint line)
+// All ui_* state is read/written by Core 0; g_lastForceSampleLb is written
+// by the force-sampling task (also Core 0) and read by ui_tick — volatile.
+// Progress is time-based on Core 0, so no inter-core publishing is needed.
+
+enum UiPhase {
+  UI_BOOT,        // splash; ui_tick is a no-op
+  UI_IDLE,
+  UI_HOMING,      // animated dots, no progress bar
+  UI_RUNNING,     // progress bar + label/force
+  UI_DONE,        // result + NFC prompt
+  UI_SAVED,
+  UI_ABORTED,
+  UI_CAL,
+  UI_ERROR,
+};
+
+UiPhase     g_uiPhase = UI_BOOT;
+const char* g_uiLabel = "";
+uint8_t     g_uiPhaseStartPct = 0;
+uint8_t     g_uiPhaseEndPct   = 0;
+uint32_t    g_phaseStartMs    = 0;     // wall-clock time at phase start
+uint32_t    g_phaseDurationMs = 0;     // expected phase duration
+bool        g_uiShowForce     = false;
+uint8_t     g_uiProgressPct   = 0;
+float       g_uiCofValue      = 0.0f;
+int         g_uiCalStep       = 0;
+const char* g_uiCalLine1      = "";
+const char* g_uiCalLine2      = "";
+const char* g_uiCalFooter     = "";
+uint8_t     g_uiAnimFrame     = 0;
+uint32_t    g_uiLastDrawMs    = 0;
+
+volatile float g_lastForceSampleLb = 0.0f;
+// ============================================================================
+
 const char* PREFS_NAMESPACE = "cof";
 const char* KEY_CAL         = "calib";
 const char* KEY_TARE        = "tare";
@@ -184,9 +224,6 @@ void   stepperEnable(bool on);
 void   setDir(bool forward);
 void   doStepBlocking(int pulseUs);
 bool   limitHit();
-void   oledHeader(const char* line1);
-void   oledKV(const char* k, const String& v);
-void   showSplash();
 void   saveCalibration();
 void   loadCalibration();
 long   nauReadRawAvg(int n);
@@ -199,20 +236,30 @@ bool   checkAbortButton();
 void   moveStepsBlocking(long steps, bool forward, int pulseUs);
 RunResult runTest();
 bool   readButton(Btn& b, bool& shortPress, bool& longPress);
-void   updateLiveForceLine(bool forceClear=false);
 void   setLED(uint8_t r, uint8_t g, uint8_t b);
 void   ledOff();
 void   rainbowCycle(int durationMs);
 void   pulseLED(uint8_t r, uint8_t g, uint8_t b, int times, int pulseMs);
 uint32_t colorWheel(byte pos);
-void   displayTestResults(float cof, int machineID);
-void   displayRFIDSuccess();
-void   displayRFIDRetry(int attemptsLeft);
-void   displayRFIDFinalFailure();
 bool   writeToRFID(float cofValue);
 void   dumpTestDataCSV();
 
+// UI module
+void   ui_drawHeader(const char* statusPill);
+void   ui_drawFooter(const char* hint);
+void   ui_screenSplash();
+void   ui_screenIdle();
+void   ui_screenHoming();
+void   ui_screenRunning();
+void   ui_screenDone();
+void   ui_screenSaved();
+void   ui_screenAborted(const char* primaryLine);
+void   ui_screenCalStep();
+void   ui_screenError(const char* title, const char* line1, const char* line2);
+void   ui_tick();
+
 // Dual-core function prototypes
+void   mainTask(void* parameter);
 void   motionTask(void* parameter);
 void   forceSamplingTask(void* parameter);
 void   executePureMove(long steps, bool forward, int pulseUs);
@@ -235,34 +282,6 @@ void doStepBlocking(int pulseUs) {
 bool limitHit() {
   int val = digitalRead(PIN_LIMIT);
   return LIMIT_ACTIVE_LOW ? (val == LOW) : (val == HIGH);
-}
-
-void oledHeader(const char* line1) {
-  oled.clearDisplay();
-  oled.setTextSize(1);
-  oled.setTextColor(SSD1306_WHITE);
-  oled.setCursor(0, 0);
-  oled.println(line1);
-  oled.drawLine(0, 10, OLED_WIDTH, 10, SSD1306_WHITE);
-  oled.setCursor(0, 14);
-}
-
-void oledKV(const char* k, const String& v) {
-  oled.print(k);
-  oled.print(F(": "));
-  oled.println(v);
-}
-
-void showSplash() {
-  oled.clearDisplay();
-  oled.setTextSize(2);
-  oled.setTextColor(SSD1306_WHITE);
-  // "Powering" ~96px @ size 2; center roughly
-  oled.setCursor(8, 16);
-  oled.println(F("Powering"));
-  oled.setCursor(28, 36);
-  oled.println(F("On..."));
-  oled.display();
 }
 
 // ----------------------------- RGB LED Functions ----------------------------
@@ -323,6 +342,271 @@ void pulseLED(uint8_t r, uint8_t g, uint8_t b, int times, int pulseMs) {
   }
 }
 
+// ============================== UI MODULE ===================================
+// All screens follow the same grid: 12px header / 40px body / 12px footer.
+// Each ui_screen* clears, draws header/body/footer, calls oled.display().
+// ui_tick() is invoked from requestMotion()'s semaphore polling loop so the
+// progress bar and homing animation stay live without a separate UI task.
+
+static int ui_centerX(const char* s, uint8_t size) {
+  uint8_t charW = (size == 2) ? 12 : (size == 3 ? 18 : 6);
+  int w = (int)strlen(s) * charW;
+  int x = (OLED_WIDTH - w) / 2;
+  return x < 0 ? 0 : x;
+}
+
+void ui_drawHeader(const char* statusPill) {
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setTextSize(1);
+  oled.setCursor(0, 2);
+  oled.print(F("COF Tester"));
+
+  if (statusPill && statusPill[0]) {
+    int textPx = (int)strlen(statusPill) * 6;
+    int pillW  = textPx + 4;
+    int pillX  = OLED_WIDTH - pillW;
+    oled.fillRect(pillX, 0, pillW, 11, SSD1306_WHITE);
+    oled.setTextColor(SSD1306_BLACK);
+    oled.setCursor(pillX + 2, 2);
+    oled.print(statusPill);
+    oled.setTextColor(SSD1306_WHITE);
+  }
+
+  oled.drawLine(0, 11, OLED_WIDTH, 11, SSD1306_WHITE);
+}
+
+void ui_drawFooter(const char* hint) {
+  if (!hint || !hint[0]) return;
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setTextSize(1);
+  oled.setCursor(ui_centerX(hint, 1), 55);
+  oled.print(hint);
+}
+
+void ui_screenSplash() {
+  oled.clearDisplay();
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setTextSize(2);
+  oled.setCursor(ui_centerX("PADDLE", 2), 14);
+  oled.print(F("PADDLE"));
+  oled.setCursor(ui_centerX("COF", 2), 32);
+  oled.print(F("COF"));
+
+  oled.setTextSize(1);
+  char id[8];
+  snprintf(id, sizeof(id), "FT-%03d", MACHINE_ID);
+  oled.setCursor(ui_centerX(id, 1), 54);
+  oled.print(id);
+
+  oled.display();
+}
+
+void ui_screenIdle() {
+  oled.clearDisplay();
+  ui_drawHeader("READY");
+  oled.setTextColor(SSD1306_WHITE);
+
+  if (g_hasResult) {
+    oled.setTextSize(1);
+    oled.setCursor(ui_centerX("Last test", 1), 16);
+    oled.print(F("Last test"));
+
+    char cofStr[8];
+    dtostrf(g_lastCOF, 1, 3, cofStr);
+    oled.setTextSize(3);
+    oled.setCursor(ui_centerX(cofStr, 3), 26);
+    oled.print(cofStr);
+  } else {
+    oled.setTextSize(2);
+    oled.setCursor(ui_centerX("PADDLE", 2), 18);
+    oled.print(F("PADDLE"));
+    oled.setCursor(ui_centerX("COF", 2), 36);
+    oled.print(F("COF"));
+  }
+
+  ui_drawFooter("Press button to run");
+  oled.display();
+}
+
+void ui_screenHoming() {
+  oled.clearDisplay();
+  ui_drawHeader("RUNNING");
+
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setTextSize(2);
+  oled.setCursor(ui_centerX("Homing", 2), 22);
+  oled.print(F("Homing"));
+
+  // Animated dots: 0..3
+  oled.setTextSize(1);
+  uint8_t dots = g_uiAnimFrame & 0x03;
+  oled.setCursor(58, 44);
+  for (uint8_t i = 0; i < dots; i++) oled.print('.');
+
+  ui_drawFooter("Hold to abort");
+  oled.display();
+}
+
+void ui_screenRunning() {
+  oled.clearDisplay();
+  ui_drawHeader("RUNNING");
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setTextSize(1);
+
+  // Phase label (left) and percent (right) above the bar
+  oled.setCursor(2, 14);
+  oled.print(g_uiLabel);
+
+  uint8_t pct = g_uiProgressPct > 100 ? 100 : g_uiProgressPct;
+  char pctStr[6];
+  snprintf(pctStr, sizeof(pctStr), "%u%%", pct);
+  int pctPx = (int)strlen(pctStr) * 6;
+  oled.setCursor(OLED_WIDTH - pctPx - 2, 14);
+  oled.print(pctStr);
+
+  // Progress bar
+  const int barX = 4, barY = 26, barW = 120, barH = 10;
+  oled.drawRect(barX, barY, barW, barH, SSD1306_WHITE);
+  int fillW = ((barW - 2) * pct) / 100;
+  if (fillW > 0) oled.fillRect(barX + 1, barY + 1, fillW, barH - 2, SSD1306_WHITE);
+
+  // Live force readout (only during measurement phases)
+  if (g_uiShowForce) {
+    char line[24];
+    snprintf(line, sizeof(line), "Force  %.3f lb", fabsf(g_lastForceSampleLb));
+    oled.setCursor(ui_centerX(line, 1), 42);
+    oled.print(line);
+  }
+
+  ui_drawFooter("Hold to abort");
+  oled.display();
+}
+
+void ui_screenDone() {
+  oled.clearDisplay();
+  ui_drawHeader("TAP TAG");
+  oled.setTextColor(SSD1306_WHITE);
+
+  char cofStr[8];
+  dtostrf(g_uiCofValue, 1, 3, cofStr);
+  oled.setTextSize(3);
+  oled.setCursor(ui_centerX(cofStr, 3), 14);
+  oled.print(cofStr);
+
+  oled.setTextSize(1);
+  oled.setCursor(ui_centerX("Tap NFC tag", 1), 42);
+  oled.print(F("Tap NFC tag"));
+
+  ui_drawFooter("Hold button to skip");
+  oled.display();
+}
+
+void ui_screenSaved() {
+  oled.clearDisplay();
+  ui_drawHeader("SAVED");
+  oled.setTextColor(SSD1306_WHITE);
+
+  char cofStr[8];
+  dtostrf(g_uiCofValue, 1, 3, cofStr);
+  oled.setTextSize(3);
+  oled.setCursor(ui_centerX(cofStr, 3), 22);
+  oled.print(cofStr);
+
+  oled.setTextSize(1);
+  oled.setCursor(ui_centerX("saved to tag", 1), 54);
+  oled.print(F("saved to tag"));
+
+  oled.display();
+}
+
+void ui_screenAborted(const char* primaryLine) {
+  oled.clearDisplay();
+  ui_drawHeader("ABORTED");
+  oled.setTextColor(SSD1306_WHITE);
+
+  const char* line = (primaryLine && primaryLine[0]) ? primaryLine : "Cancelled";
+  oled.setTextSize(2);
+  oled.setCursor(ui_centerX(line, 2), 22);
+  oled.print(line);
+
+  oled.setTextSize(1);
+  oled.setCursor(ui_centerX("Returning home", 1), 46);
+  oled.print(F("Returning home"));
+
+  oled.display();
+}
+
+void ui_screenCalStep() {
+  oled.clearDisplay();
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setTextSize(1);
+
+  // Header: "CAL  Step N/2" (or just "CAL" when step==0)
+  oled.setCursor(0, 2);
+  if (g_uiCalStep > 0) {
+    char header[16];
+    snprintf(header, sizeof(header), "CAL  Step %d/2", g_uiCalStep);
+    oled.print(header);
+  } else {
+    oled.print(F("CAL"));
+  }
+  oled.drawLine(0, 11, OLED_WIDTH, 11, SSD1306_WHITE);
+
+  if (g_uiCalLine1 && g_uiCalLine1[0]) {
+    oled.setCursor(2, 18);
+    oled.print(g_uiCalLine1);
+  }
+  if (g_uiCalLine2 && g_uiCalLine2[0]) {
+    oled.setCursor(2, 32);
+    oled.print(g_uiCalLine2);
+  }
+
+  ui_drawFooter(g_uiCalFooter);
+  oled.display();
+}
+
+void ui_screenError(const char* title, const char* line1, const char* line2) {
+  oled.clearDisplay();
+  ui_drawHeader("ERROR");
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setTextSize(1);
+
+  if (title && title[0]) {
+    oled.setCursor(ui_centerX(title, 1), 18);
+    oled.print(title);
+  }
+  if (line1 && line1[0]) {
+    oled.setCursor(ui_centerX(line1, 1), 32);
+    oled.print(line1);
+  }
+  if (line2 && line2[0]) {
+    oled.setCursor(ui_centerX(line2, 1), 44);
+    oled.print(line2);
+  }
+  oled.display();
+}
+
+// Transient redraw, called from requestMotion()'s polling loop.
+// Time-based progress: pct = startPct + (elapsed/duration) * span.
+// No throttle — the OLED I2C transfer (~25ms at 400kHz) is the natural
+// pacing limit, which gives ~30 Hz when the bus is otherwise idle.
+void ui_tick() {
+  uint32_t now = millis();
+  g_uiLastDrawMs = now;
+  g_uiAnimFrame++;
+
+  if (g_uiPhase == UI_RUNNING) {
+    uint32_t elapsed = now - g_phaseStartMs;
+    uint32_t duration = g_phaseDurationMs ? g_phaseDurationMs : 1;
+    if (elapsed > duration) elapsed = duration;
+    int span = (int)g_uiPhaseEndPct - (int)g_uiPhaseStartPct;
+    g_uiProgressPct = g_uiPhaseStartPct + (uint8_t)((elapsed * span) / duration);
+    ui_screenRunning();
+  } else if (g_uiPhase == UI_HOMING) {
+    ui_screenHoming();
+  }
+}
+
 // ----------------------------- Calibration ----------------------------------
 void saveCalibration() {
   prefs.begin(PREFS_NAMESPACE, false);
@@ -358,22 +642,22 @@ float rawToPounds(long raw) {
 }
 
 void doCalibration3lb() {
-  // ---- Move carriage to furthest position for calibration ----
   g_abortRequested = false;
   g_abortBtnDownAt = 0;
+  g_uiPhase = UI_CAL;
 
-  oledHeader("CAL: Positioning...");
-  oled.println(F("Moving to cal position"));
-  oled.display();
-  setLED(255, 150, 0); // Yellow during positioning
+  // ---- Position sled at furthest end ----
+  g_uiCalStep   = 0;
+  g_uiCalLine1  = "Positioning sled";
+  g_uiCalLine2  = "Stand clear";
+  g_uiCalFooter = "Hold to abort";
+  ui_screenCalStep();
+  setLED(255, 150, 0);
 
-  // First home to ensure consistent starting point
   homeToLimitSafe();
-
   if (g_abortRequested) goto cal_abort;
 
   {
-  // Move to furthest position (lowering + measurement distance)
   const long calPositionSteps = lround((SEG_LOWER_IN + SEG_MEASURE_IN) * STEPS_PER_INCH);
 
   MotionRequest req;
@@ -388,38 +672,41 @@ void doCalibration3lb() {
   requestMotion(req);
 
   if (g_abortRequested) goto cal_abort;
-
   ledOff();
 
   // ---- Step 1: Tare (zero-load) ----
-  oledHeader("CAL: Step 1/2 (Tare)");
-  oled.println(F("Remove all load"));
-  oled.println(F("Press START to tare"));
-  oled.display();
+  g_uiCalStep   = 1;
+  g_uiCalLine1  = "Remove all load";
+  g_uiCalLine2  = "from sled";
+  g_uiCalFooter = "Tap to tare";
+  ui_screenCalStep();
 
-  // Wait for START button press (debounced)
   bool sp = false, lp = false;
   while (!sp && !lp) {
     readButton(btnStart, sp, lp);
     delay(10);
   }
 
-  oledHeader("CAL: Taring...");
-  oled.display();
-  setLED(255, 0, 0); // Red during tare
+  g_uiCalLine1  = "Taring...";
+  g_uiCalLine2  = "Hold still";
+  g_uiCalFooter = "";
+  ui_screenCalStep();
+  setLED(255, 0, 0);
   g_tareRaw = nauReadRawAvg(HX_SAMPLES_TARE);
   ledOff();
 
   // ---- Step 2: Known weight ----
-  String headerStr = "CAL: Step 2/2 (" + String(CAL_WEIGHT_LB, 3) + " lb)";
-  oledHeader(headerStr.c_str());
-  oled.print(F("Place "));
-  oled.print(CAL_WEIGHT_LB, 3);
-  oled.println(F(" lb weight"));
-  oled.println(F("Press START to sample"));
-  oled.display();
+  char weightStr[10];
+  dtostrf(CAL_WEIGHT_LB, 1, 3, weightStr);
+  char placeLine[24];
+  snprintf(placeLine, sizeof(placeLine), "Place %s lb", weightStr);
 
-  // Wait for START button press (debounced)
+  g_uiCalStep   = 2;
+  g_uiCalLine1  = placeLine;
+  g_uiCalLine2  = "weight on sled";
+  g_uiCalFooter = "Tap to sample";
+  ui_screenCalStep();
+
   sp = false;
   lp = false;
   while (!sp && !lp) {
@@ -427,18 +714,24 @@ void doCalibration3lb() {
     delay(10);
   }
 
+  g_uiCalLine1  = "Sampling...";
+  g_uiCalLine2  = "Hold still";
+  g_uiCalFooter = "";
+  ui_screenCalStep();
+
   long raw3 = nauReadRawAvg(HX_SAMPLES_TARE);
-  long delta = raw3 - g_tareRaw; // counts due to calibration weight
+  long delta = raw3 - g_tareRaw;
 
   if (abs(delta) < 100) {
-    oledHeader("CAL FAILED");
-    oled.println(F("Signal too small"));
-    oled.display();
-    delay(2000);
+    ui_screenError("Calibration failed", "Signal too small", "Check wiring");
+    pulseLED(255, 0, 0, 1, 250);
+    delay(2200);
 
-    // Return carriage to home even on failure
-    oledHeader("Returning...");
-    oled.display();
+    g_uiCalStep   = 0;
+    g_uiCalLine1  = "Returning...";
+    g_uiCalLine2  = "";
+    g_uiCalFooter = "";
+    ui_screenCalStep();
     homeToLimitSafe();
 
     MotionRequest reqDisable;
@@ -447,27 +740,39 @@ void doCalibration3lb() {
     return;
   }
 
-  // counts per lb
   g_calibration = (float)delta / CAL_WEIGHT_LB;
   saveCalibration();
 
-  oledHeader("CAL DONE");
-  String countsLabel = "Counts@" + String(CAL_WEIGHT_LB, 3) + "lb";
-  oledKV(countsLabel.c_str(), String(delta));
-  oledKV("Cal (cnt/lb)", String(g_calibration, 2));
-  oledKV("TareRaw", String(g_tareRaw));
-  oled.display();
-  delay(1500);
+  // Done summary
+  oled.clearDisplay();
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setTextSize(1);
+  oled.setCursor(0, 2);
+  oled.print(F("CAL  Done"));
+  oled.drawLine(0, 11, OLED_WIDTH, 11, SSD1306_WHITE);
 
-  // ---- Return carriage to home position ----
-  oledHeader("CAL: Returning...");
-  oled.println(F("Moving to home"));
+  char buf[24];
+  snprintf(buf, sizeof(buf), "Cnt/lb : %.2f", g_calibration);
+  oled.setCursor(2, 16); oled.print(buf);
+  snprintf(buf, sizeof(buf), "Tare   : %ld", g_tareRaw);
+  oled.setCursor(2, 28); oled.print(buf);
+  snprintf(buf, sizeof(buf), "Delta  : %ld", delta);
+  oled.setCursor(2, 40); oled.print(buf);
+  ui_drawFooter("Saved to flash");
   oled.display();
-  setLED(255, 150, 0); // Yellow during return
+  pulseLED(0, 255, 0, 1, 200);
+  delay(1800);
+
+  // ---- Return to home ----
+  g_uiCalStep   = 0;
+  g_uiCalLine1  = "Returning...";
+  g_uiCalLine2  = "";
+  g_uiCalFooter = "";
+  ui_screenCalStep();
+  setLED(255, 150, 0);
 
   homeToLimitSafe();
 
-  // Disable stepper
   {
     MotionRequest reqDisable;
     reqDisable.cmd = CMD_DISABLE;
@@ -485,13 +790,13 @@ cal_abort:
     g_collectSamples = false;
     g_abortRequested = false;
     g_abortBtnDownAt = 0;
-    oledHeader("CAL ABORTED");
-    oled.println(F("Homing..."));
-    oled.display();
+    ui_screenAborted("Cal cancelled");
     setLED(255, 0, 0);
 
     while (digitalRead(BTN_START) == LOW) delay(10);
 
+    g_uiPhase = UI_HOMING;
+    ui_screenHoming();
     homeToLimitForce();
 
     MotionRequest reqDis;
@@ -499,7 +804,7 @@ cal_abort:
     requestMotion(reqDis, 1000);
 
     ledOff();
-    delay(1500);
+    delay(1200);
   }
 }
 
@@ -524,12 +829,13 @@ bool checkAbortButton() {
   return false;
 }
 
-// Core 1: Pure stepping function (NO load cell, NO I2C, NO Serial in critical loop)
+// Core 1: Pure stepping function (NO load cell, NO I2C, NO Serial in critical loop).
+// Progress reporting is done time-based on Core 0 (millis() vs phase duration) —
+// no inter-core publishing here, just clean stepping with periodic abort checks.
 void executePureMove(long steps, bool forward, int pulseUs) {
   setDir(forward);
-
   for (long i = 0; i < steps; i++) {
-    if ((i & 0x1FF) == 0 && checkAbortButton()) break;  // Check every ~512 steps
+    if ((i & 0xFF) == 0 && checkAbortButton()) break;  // Abort check every ~256 steps
     doStepBlocking(pulseUs);
   }
 }
@@ -680,7 +986,9 @@ void forceSamplingTask(void* parameter) {
         while (g_collectSamples && *sampleCount < maxSamples) {
           if (nau.available()) {
             long raw = nau.getReading();
-            sampleBuffer[*sampleCount] = rawToPounds(raw);
+            float lbs = rawToPounds(raw);
+            sampleBuffer[*sampleCount] = lbs;
+            g_lastForceSampleLb = lbs;        // Publish for UI live readout
             (*sampleCount)++;
           }
           vTaskDelay(1);  // Yield briefly (~1ms)
@@ -692,21 +1000,24 @@ void forceSamplingTask(void* parameter) {
   }
 }
 
-// Core 0: Request motion from Core 1 (wrapper function)
+// Core 0: Request motion from Core 1 (wrapper function).
+// Polls the completion semaphore in 30ms slices so ui_tick() can keep the
+// progress bar / homing animation live without a dedicated UI task.
 bool requestMotion(MotionRequest req, uint32_t timeoutMs) {
-  // Send command to Core 1
   if (xQueueSend(motionCommandQueue, &req, pdMS_TO_TICKS(100)) != pdTRUE) {
     Serial.println("ERROR: Motion queue full");
     return false;
   }
 
-  // Wait for completion
-  if (xSemaphoreTake(motionCompleteSemaphore, pdMS_TO_TICKS(timeoutMs)) != pdTRUE) {
-    Serial.println("ERROR: Motion timeout");
-    return false;
+  uint32_t deadline = millis() + timeoutMs;
+  while ((int32_t)(deadline - millis()) > 0) {
+    if (xSemaphoreTake(motionCompleteSemaphore, pdMS_TO_TICKS(30)) == pdTRUE) {
+      return true;
+    }
+    ui_tick();
   }
-
-  return true;
+  Serial.println("ERROR: Motion timeout");
+  return false;
 }
 
 // Core 0: High-level wrapper functions
@@ -800,46 +1111,58 @@ RunResult runTest() {
   const long steps_noise   = lround(SEG_NOISE_IN   * STEPS_PER_INCH);
   const long steps_measure = lround(SEG_MEASURE_IN * STEPS_PER_INCH);
 
-  // Reset sample counters and abort state
   g_fwdSampleCount = 0;
   g_revSampleCount = 0;
   g_abortRequested = false;
   g_abortBtnDownAt = 0;
 
-  // Homing
-  oledHeader("Homing...");
-  oled.display();
+  // Initial homing — animated "Homing" screen via ui_tick during requestMotion.
+  g_uiPhase = UI_HOMING;
+  ui_screenHoming();
   homeToLimitSafe();
-
   if (g_abortRequested) goto abort_cleanup;
 
   {
-  // Lowering (no sampling)
-  oledHeader("Running (forward)...");
-  oled.println(F("Lowering..."));
-  oled.display();
-  setLED(255, 150, 0);  // Yellow
+  // Switch to single progress-bar screen for the rest of the test.
+  // Phase % bands sum to 100: lower 0-20, fwd 20-49, pause 49-51, rev 51-80, return 80-100.
+  // Each phase's expected duration is (steps * 2 * pulseUs) / 1000 ms.
+  const uint32_t dur_lower   = (uint32_t)(steps_lower + steps_noise) * 2u * STEP_PULSE_US / 1000u;
+  const uint32_t dur_measure = (uint32_t)steps_measure              * 2u * STEP_PULSE_US / 1000u;
+  const uint32_t dur_return  = (uint32_t)(steps_noise + steps_lower) * 2u * STEP_PULSE_US / 1000u;
+
+  g_uiPhase = UI_RUNNING;
+  g_uiProgressPct = 0;
+  ui_screenRunning();
 
   MotionRequest req;
-
-  // Enable stepper
   req.cmd = CMD_ENABLE;
   requestMotion(req, 1000);
 
-  // Lower phase
+  // Lowering: 0% -> 20%
+  setLED(255, 150, 0);
+  g_uiLabel = "Lowering";
+  g_uiShowForce = false;
+  g_uiPhaseStartPct = 0;
+  g_uiPhaseEndPct   = 20;
+  g_phaseDurationMs = dur_lower;
+  g_phaseStartMs    = millis();
+
   req.cmd = CMD_MOVE;
-  req.steps = steps_lower + steps_noise;  // Combined lowering + noise segments
+  req.steps = steps_lower + steps_noise;
   req.direction = DIR_FORWARD;
   req.pulseUs = STEP_PULSE_US;
   req.phase = PHASE_LOWERING;
   requestMotion(req);
-
   if (g_abortRequested) goto abort_cleanup;
 
-  // Forward measurement pass
-  oledHeader("Measuring (FWD)...");
-  oled.display();
+  // Forward measurement: 20% -> 49%
   setLED(0, 255, 255);  // Cyan
+  g_uiLabel = "Forward";
+  g_uiShowForce = true;
+  g_uiPhaseStartPct = 20;
+  g_uiPhaseEndPct   = 49;
+  g_phaseDurationMs = dur_measure;
+  g_phaseStartMs    = millis();
 
   req.cmd = CMD_MEASURE_MOVE;
   req.steps = steps_measure;
@@ -847,16 +1170,28 @@ RunResult runTest() {
   req.pulseUs = STEP_PULSE_US;
   req.phase = PHASE_MEASURING_FWD;
   requestMotion(req);
-
   if (g_abortRequested) goto abort_cleanup;
 
-  // Pause between passes
-  delay(600);
+  // Direction-reversal pause: 49% -> 51% (timed, 600ms)
+  g_uiLabel = "Reversing";
+  g_uiShowForce = false;
+  g_uiPhaseStartPct = 49;
+  g_uiPhaseEndPct   = 51;
+  g_phaseDurationMs = 600;
+  g_phaseStartMs    = millis();
+  while ((int32_t)(millis() - g_phaseStartMs) < 600) {
+    ui_tick();
+    delay(20);
+  }
 
-  // Reverse measurement pass
-  oledHeader("Measuring (REV)...");
-  oled.display();
+  // Reverse measurement: 51% -> 80%
   setLED(255, 0, 255);  // Magenta
+  g_uiLabel = "Reverse";
+  g_uiShowForce = true;
+  g_uiPhaseStartPct = 51;
+  g_uiPhaseEndPct   = 80;
+  g_phaseDurationMs = dur_measure;
+  g_phaseStartMs    = millis();
 
   req.cmd = CMD_MEASURE_MOVE;
   req.steps = steps_measure;
@@ -864,44 +1199,47 @@ RunResult runTest() {
   req.pulseUs = STEP_PULSE_US;
   req.phase = PHASE_MEASURING_REV;
   requestMotion(req);
-
   if (g_abortRequested) goto abort_cleanup;
 
-  // Return
-  oledHeader("Returning...");
-  oled.display();
-  setLED(255, 150, 0);  // Yellow
+  // Return: 80% -> 100%
+  setLED(255, 150, 0);
+  g_uiLabel = "Returning";
+  g_uiShowForce = false;
+  g_uiPhaseStartPct = 80;
+  g_uiPhaseEndPct   = 100;
+  g_phaseDurationMs = dur_return;
+  g_phaseStartMs    = millis();
 
   req.cmd = CMD_MOVE;
-  req.steps = steps_noise + steps_lower;  // Combined noise + lower segments
+  req.steps = steps_noise + steps_lower;
   req.direction = !DIR_FORWARD;
   req.pulseUs = STEP_PULSE_US;
   req.phase = PHASE_RETURNING;
   requestMotion(req);
 
+  // Final precision homing — bar already at 100%, leave RUNNING screen up.
   homeToLimitSafe();
 
-  // Disable stepper
   req.cmd = CMD_DISABLE;
   requestMotion(req, 1000);
   }
 
-  goto test_complete;  // Skip abort cleanup on normal path
+  goto test_complete;
 
 abort_cleanup:
   {
     Serial.println("TEST ABORTED - homing...");
     g_collectSamples = false;
-    g_abortRequested = false;  // Clear so forced home proceeds
+    g_abortRequested = false;
     g_abortBtnDownAt = 0;
-    oledHeader("ABORTED");
-    oled.println(F("Homing..."));
-    oled.display();
-    setLED(255, 0, 0);  // Red
+    g_uiPhase = UI_ABORTED;
+    ui_screenAborted("Cancelled");
+    setLED(255, 0, 0);
 
-    // Wait for button release before homing
     while (digitalRead(BTN_START) == LOW) delay(10);
 
+    g_uiPhase = UI_HOMING;
+    ui_screenHoming();
     homeToLimitForce();
 
     MotionRequest reqDis;
@@ -909,10 +1247,7 @@ abort_cleanup:
     requestMotion(reqDis, 1000);
 
     ledOff();
-    oledHeader("ABORTED");
-    oled.println(F("Test cancelled"));
-    oled.display();
-    delay(1500);
+    delay(800);
 
     RunResult abortResult;
     abortResult.avgFrictionLb = 0;
@@ -922,7 +1257,6 @@ abort_cleanup:
   }
 
 test_complete:
-  // ========== SERIAL REPORTING ==========
   Serial.println("\n===== TEST COMPLETE =====");
   Serial.print("Forward pass samples: ");
   Serial.println(g_fwdSampleCount);
@@ -932,7 +1266,6 @@ test_complete:
   Serial.println(g_fwdSampleCount + g_revSampleCount);
   Serial.println("========================\n");
 
-  // Paired midpoint COF calculation (handles trim internally)
   float trimFraction = SEG_TRIM_IN / SEG_MEASURE_IN;
   CofResult cr = calculateCOF(g_fwdSamples, g_fwdSampleCount,
                                g_revSamples, g_revSampleCount,
@@ -951,8 +1284,8 @@ test_complete:
   Serial.println(cr.cof, 4);
   Serial.println("========================\n");
 
-  // Test complete - pulse green 3 times
-  pulseLED(0, 255, 0, 3, 300);
+  // Quick green flash — operator's eyes are on the screen, not the LED.
+  pulseLED(0, 255, 0, 1, 200);
 
   RunResult rr;
   rr.avgFrictionLb = cr.avgForceLb;
@@ -1008,91 +1341,15 @@ bool readButton(Btn& b, bool& shortPress, bool& longPress) {
 }
 
 // ----------------------------- RFID Functions -------------------------------
-// Display COF results with RFID prompt
-void displayTestResults(float cof, int machineID) {
-  oled.clearDisplay();
-
-  char cofStr[10];
-  dtostrf(cof, 1, 3, cofStr);
-
-  // Display results - split screen vertically
-  oled.setTextSize(1);
-  oled.setTextColor(SSD1306_WHITE);
-
-  // Left side: COF value
-  oled.setCursor(0, 8);
-  oled.println("COF");
-  oled.setCursor(0, 18);
-  oled.println("----------");
-  oled.setCursor(0, 28);
-  oled.setTextSize(2);
-  oled.println(cofStr);
-
-  // Right side: Present NFC prompt
-  oled.setTextSize(1);
-  oled.setCursor(75, 20);
-  oled.println("Present");
-  oled.setCursor(80, 30);
-  oled.println("NFC");
-
-  // Bottom: skip hint
-  oled.setCursor(0, 56);
-  oled.println("hold button to skip");
-
-  oled.display();
-}
-
-// Display RFID write success
-void displayRFIDSuccess() {
-  oled.clearDisplay();
-  oled.setTextSize(2);
-  oled.setTextColor(SSD1306_WHITE);
-  oled.setCursor(20, 24);
-  oled.println("Success!");
-  oled.display();
-  pulseLED(0, 255, 0, 2, 300); // Green pulse
-  delay(1500);
-}
-
-// Display RFID retry prompt
-void displayRFIDRetry(int attemptsLeft) {
-  oled.clearDisplay();
-  oled.setTextSize(1);
-  oled.setTextColor(SSD1306_WHITE);
-  oled.setCursor(30, 20);
-  oled.println("Try again");
-  oled.setCursor(15, 35);
-  oled.print("(");
-  oled.print(attemptsLeft);
-  oled.print(" attempts left)");
-  oled.display();
-  setLED(255, 150, 0); // Orange/yellow for retry
-  delay(1000);
-  ledOff();
-}
-
-// Display RFID write final failure
-void displayRFIDFinalFailure() {
-  oled.clearDisplay();
-  oled.setTextSize(1);
-  oled.setTextColor(SSD1306_WHITE);
-  oled.setCursor(15, 20);
-  oled.println("Write failed");
-  oled.setCursor(10, 35);
-  oled.println("Continuing...");
-  oled.display();
-  pulseLED(255, 0, 0, 2, 300); // Red pulse for failure
-  delay(3000);
-}
 
 // Write measurement to RFID tag - single 5-minute poll, no retry screens.
 // Returns: true on success, false on skip (button hold), tag-full, or timeout.
+// Caller is expected to have already drawn ui_screenDone() before invoking.
 bool writeToRFID(float cofValue) {
   Serial.println("Starting RFID write process...");
   Serial.print("COF value: ");
   Serial.println(cofValue, 3);
 
-  // Create measurement (CoF type)
   PaddleDNA::Measurement measurement(
     PaddleDNA::MeasurementType::CoF,
     MACHINE_UUID,
@@ -1101,8 +1358,8 @@ bool writeToRFID(float cofValue) {
   );
 
   const unsigned long TAG_WAIT_TIMEOUT = 300000;  // 5 minutes
-  const unsigned long SKIP_HOLD_MS = 2000;
-  unsigned long startTime = millis();
+  const unsigned long SKIP_HOLD_MS     = 2000;
+  unsigned long startTime    = millis();
   unsigned long lastPollTime = 0;
   bool ledState = false;
 
@@ -1115,14 +1372,9 @@ bool writeToRFID(float cofValue) {
       }
       if (millis() - holdStart >= SKIP_HOLD_MS) {
         ledOff();
-        oled.clearDisplay();
-        oled.setTextSize(1);
-        oled.setTextColor(SSD1306_WHITE);
-        oled.setCursor(36, 24);
-        oled.println("Skipped");
-        oled.display();
+        ui_screenAborted("Skipped");
         setLED(255, 150, 0);
-        delay(1000);
+        delay(800);
         ledOff();
         return false;
       }
@@ -1150,21 +1402,18 @@ bool writeToRFID(float cofValue) {
     switch (result) {
       case PaddleDNA::AccumulateResult::Success:
         ledOff();
-        displayRFIDSuccess();
+        g_uiCofValue = cofValue;
+        g_uiPhase = UI_SAVED;
+        ui_screenSaved();
+        pulseLED(0, 255, 0, 1, 200);
+        delay(700);
         return true;
 
       case PaddleDNA::AccumulateResult::TagFull:
         ledOff();
-        oled.clearDisplay();
-        oled.setTextSize(1);
-        oled.setTextColor(SSD1306_WHITE);
-        oled.setCursor(15, 16);
-        oled.println("Tag is full!");
-        oled.setCursor(10, 32);
-        oled.println("Use a new tag");
-        oled.display();
-        pulseLED(255, 0, 0, 3, 300);
-        delay(3000);
+        ui_screenError("Tag full", "Use a new tag", "");
+        pulseLED(255, 0, 0, 1, 250);
+        delay(2200);
         return false;
 
       case PaddleDNA::AccumulateResult::NoTag:
@@ -1172,39 +1421,17 @@ bool writeToRFID(float cofValue) {
       case PaddleDNA::AccumulateResult::WriteError:
       case PaddleDNA::AccumulateResult::InvalidPayload:
       case PaddleDNA::AccumulateResult::CryptoError:
-        // Keep polling silently - stay on the Present NFC screen
+        // Keep polling silently — stay on the Tap-NFC screen
         break;
     }
   }
 
   // 5-minute timeout reached
   ledOff();
-  displayRFIDFinalFailure();
+  ui_screenError("NFC timeout", "Tag not written", "");
+  pulseLED(255, 0, 0, 1, 250);
+  delay(2200);
   return false;
-}
-
-// ----------------------------- Live Force Overlay ---------------------------
-unsigned long g_lastForceDrawMs = 0;
-void updateLiveForceLine(bool forceClear) {
-  if (g_motionActive) return; // avoid OLED writes during motion
-  if (!nau.available()) return;
-
-  unsigned long now = millis();
-  if (!forceClear && (now - g_lastForceDrawMs) < 1000) return; // 1 Hz
-  g_lastForceDrawMs = now;
-
-  long raw = nau.getReading();
-  float lbs = rawToPounds(raw);
-
-  // Draw a single-line overlay at the bottom without clearing the whole screen
-  // Clear the bottom 10px band
-  oled.fillRect(0, OLED_HEIGHT-12, OLED_WIDTH, 12, SSD1306_BLACK);
-  oled.setCursor(0, OLED_HEIGHT-10);
-  oled.setTextSize(1);
-  oled.setTextColor(SSD1306_WHITE);
-  oled.print(F("Force (lb): "));
-  oled.println(String(lbs, 3));
-  oled.display();
 }
 
 // ----------------------------- Setup / Loop ---------------------------------
@@ -1248,6 +1475,11 @@ void setup() {
   Wire.begin(I2C_SDA, I2C_SCL);
   delay(100);  // Critical delay for ESP32-S3 I2C stability
   oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+  // IMPORTANT: setClock must come AFTER oled.begin() — the Adafruit BusIO
+  // library forces 100 kHz inside begin(), which makes a full-frame display()
+  // take ~80 ms and starves the progress-bar redraw loop. 400 kHz drops it
+  // to ~20 ms; PN532 (also on Wire) is fine up to 400 kHz.
+  Wire.setClock(400000);
   oled.clearDisplay();
   oled.display();
   Serial.println("OLED ready");
@@ -1256,15 +1488,9 @@ void setup() {
   Serial.println("Initializing PaddleDNA NFC...");
   if (!nfc.begin(Wire)) {
     Serial.println(F("NFC initialization failed!"));
-    oled.clearDisplay();
-    oled.setTextSize(1);
-    oled.setCursor(0, 20);
-    oled.println("NFC INIT FAILED!");
-    oled.setCursor(0, 35);
-    oled.println("Check connections");
-    oled.display();
-    pulseLED(255, 0, 0, 5, 300); // Red pulse error
-    delay(3000);
+    ui_screenError("NFC init failed", "Check connections", "");
+    pulseLED(255, 0, 0, 3, 250);
+    delay(2500);
     // Continue anyway - allow force measurements without RFID
   } else {
     Serial.println("NFC initialized successfully");
@@ -1274,13 +1500,9 @@ void setup() {
   Serial.println("Initializing PaddleDNA Crypto...");
   if (!crypto.begin(MACHINE_UUID, PRIVATE_KEY)) {
     Serial.println(F("Crypto initialization failed!"));
-    oled.clearDisplay();
-    oled.setTextSize(1);
-    oled.setCursor(0, 20);
-    oled.println("CRYPTO INIT FAILED!");
-    oled.display();
-    pulseLED(255, 0, 0, 5, 300);
-    delay(3000);
+    ui_screenError("Crypto init failed", "", "");
+    pulseLED(255, 0, 0, 3, 250);
+    delay(2500);
     // Continue anyway
   } else {
     Serial.println("Crypto initialized successfully");
@@ -1295,14 +1517,9 @@ void setup() {
   Wire1.begin(NAU_SDA, NAU_SCL);
   if (!nau.begin(Wire1)) {
     Serial.println("ERROR: NAU7802 not detected!");
-    oled.clearDisplay();
-    oled.setCursor(0, 0);
-    oled.setTextSize(1);
-    oled.setTextColor(SSD1306_WHITE);
-    oled.println("NAU7802 NOT FOUND!");
-    oled.display();
-    pulseLED(255, 0, 0, 5, 300);
-    delay(3000);
+    ui_screenError("Load cell missing", "NAU7802 not found", "Check wiring");
+    pulseLED(255, 0, 0, 3, 250);
+    delay(2500);
   }
   nau.setGain(NAU7802_GAIN_128);
   nau.setSampleRate(NAU7802_SPS_320);
@@ -1377,13 +1594,14 @@ void setup() {
   Serial.println("=== Dual-Core Architecture Initialized ===\n");
   // ====================================================
 
-  showSplash();
+  g_uiPhase = UI_BOOT;
+  ui_screenSplash();
   Serial.println("Starting rainbow cycle...");
   rainbowCycle(2000); // 2 second rainbow cycle on power-up
   Serial.println("Rainbow cycle complete");
   delay(500);
 
-  // Initialization homing sequence (keep "Powering On..." splash on screen)
+  // Initialization homing — splash stays on screen (ui_tick is a no-op for UI_BOOT)
   Serial.println("Checking limit switch...");
   if (!limitHit()) {
     Serial.println("Not at limit, starting homing sequence...");
@@ -1398,96 +1616,96 @@ void setup() {
   // Boot calibration: if START button is held during power-up, enter calibration
   if (digitalRead(BTN_START) == LOW) {
     Serial.println("START button held at boot - entering calibration mode");
-    oledHeader("Boot Calibration");
-    oled.println(F("Button held..."));
-    oled.display();
-    // Wait for release before starting calibration
+    g_uiCalStep   = 0;
+    g_uiCalLine1  = "Release button";
+    g_uiCalLine2  = "to begin calibration";
+    g_uiCalFooter = "";
+    g_uiPhase = UI_CAL;
+    ui_screenCalStep();
     while (digitalRead(BTN_START) == LOW) delay(10);
     delay(200);
     doCalibration3lb();
   }
 
+  // Spawn the user-facing task on Core 0. Arduino's loopTask defaults to
+  // Core 1 — same core as motionTask (priority 3) — and a higher-priority
+  // running task starves loopTask, so requestMotion()'s polling loop never
+  // runs and ui_tick never fires. Core 0 has no such contention; motionTask
+  // owns Core 1 by itself.
+  Serial.println("Creating main UI/test task on Core 0...");
+  BaseType_t mainTaskCreated = xTaskCreatePinnedToCore(
+    mainTask,
+    "Main",
+    8192,                 // generous stack — runTest, writeToRFID, NFC are deep
+    NULL,
+    1,                    // same as Arduino's default loopTask priority
+    NULL,
+    0                     // Core 0
+  );
+  if (mainTaskCreated != pdPASS) {
+    Serial.println("ERROR: Failed to create main task!");
+  } else {
+    Serial.println("Main task created on Core 0");
+  }
+
   Serial.println("=== Setup complete, entering main loop ===\n");
 }
 
+// Default Arduino loop runs on Core 1, where motionTask lives. We can't do
+// any real work here without contending with motionTask, so this stub just
+// yields. All real work happens in mainTask on Core 0.
 void loop() {
-  // Idle screen
-  Serial.println("Entering idle state");
-  ledOff(); // Turn off LED during idle
-  oled.clearDisplay();
-  oled.setTextColor(SSD1306_WHITE);
-  // "Paddle COF" = 10 chars * 12px = 120px @ size 2; center in 128px
-  oled.setTextSize(2);
-  oled.setCursor(4, 12);
-  oled.print(F("Paddle COF"));
-  // "press button to start" = 21 chars * 6px = 126px @ size 1
-  oled.setTextSize(1);
-  oled.setCursor(1, 36);
-  oled.print(F("press button to test paddle"));
-  if (g_hasResult) {
-    oled.setCursor(0, 54);
-    oled.print(F("Last: "));
-    oled.print(String(g_lastCOF, 3));
-  }
-  oled.display();
+  vTaskDelay(pdMS_TO_TICKS(1000));
+}
 
-  g_motionActive = false;
+// Runs on Core 0. Owns the idle screen, button polling, runTest, and the
+// NFC write flow. requestMotion() blocks here while motionTask runs on
+// Core 1 — but xSemaphoreTake() actually yields properly and ui_tick()
+// gets to fire from the polling loop.
+void mainTask(void* parameter) {
+  Serial.printf("Main task running on core %d\n", xPortGetCoreID());
+
   while (true) {
-    bool sp=false, lp=false;
-    readButton(btnStart, sp, lp);
-    if (sp) {
-      Serial.println("START button pressed - Running test...");
-      RunResult r = runTest();
+    // Idle screen — last result is the hero, 1 tap kicks off a test.
+    Serial.println("Entering idle state");
+    ledOff();
+    g_uiPhase = UI_IDLE;
+    ui_screenIdle();
 
-      // Check if test was aborted (COF == 0)
-      if (r.cof == 0 && r.avgFrictionLb == 0) {
-        Serial.println("Test was aborted, returning to idle");
-        break;
+    g_motionActive = false;
+    while (true) {
+      bool sp=false, lp=false;
+      readButton(btnStart, sp, lp);
+      if (sp) {
+        Serial.println("START button pressed - Running test...");
+        RunResult r = runTest();
+
+        // Aborted test returns zeros — go straight back to idle.
+        if (r.cof == 0 && r.avgFrictionLb == 0) {
+          Serial.println("Test was aborted, returning to idle");
+          break;
+        }
+
+        g_lastAvgLb = r.avgFrictionLb;
+        g_lastCOF   = r.cof;
+        g_hasResult = true;
+
+        Serial.print("Test complete! COF: ");
+        Serial.println(r.cof, 3);
+
+        dumpTestDataCSV();
+
+        // Auto-flow: result + NFC prompt on the same screen, no "press to continue" gate.
+        g_uiPhase = UI_DONE;
+        g_uiCofValue = r.cof;
+        ui_screenDone();
+
+        Serial.println("Entering RFID write mode...");
+        writeToRFID(r.cof);  // draws its own success/skip/timeout screen + delay
+
+        break;  // back to idle (now showing the new "Last test")
       }
-
-      g_lastAvgLb = r.avgFrictionLb;
-      g_lastCOF   = r.cof;
-      g_hasResult = true;
-
-      Serial.print("Test complete! COF: ");
-      Serial.println(r.cof, 3);
-
-      dumpTestDataCSV();
-
-      // Display results with "Present NFC tag..." message
-      displayTestResults(r.cof, MACHINE_ID);
-
-      // Write to RFID tag (with retry and abort handling)
-      Serial.println("Entering RFID write mode...");
-      bool rfidSuccess = writeToRFID(r.cof);
-
-      if (rfidSuccess) {
-        Serial.println("RFID write successful");
-      } else {
-        Serial.println("RFID write failed or aborted");
-      }
-
-      // Show final result screen
-      oledHeader("Result");
-      oledKV("COF", String(r.cof, 3));
-      oled.print(F("N = "));
-      oled.print(NORMAL_FORCE_LB, 2);
-      oled.println(F(" lb"));
-      if (rfidSuccess) {
-        oled.println(F("Data saved to tag"));
-      }
-      oled.println(F("Press button..."));
-      oled.display();
-
-      // Wait here showing the result until button press
-      while (true) {
-        bool a=false, b=false;
-        readButton(btnStart, a, b);
-        if (a || b) break;
-        delay(10);
-      }
-      break; // back to idle
+      delay(10);
     }
-    delay(10);
   }
 }

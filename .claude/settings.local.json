@@ -7,7 +7,8 @@
       "Bash(dir /B \"C:\\Users\\steve\\Documents\\Arduino\\libraries\" 2)",
       "Bash(dir /B \"C:\\Users\\steve\\Documents\\Arduino\\libraries\\MFRC522_I2C\\src\" 2)",
       "Bash(arduino-cli lib list:*)",
-      "Bash(cd \"C:\\\\Users\\\\steve\\\\Documents\\\\PaddleDNA\\\\PaddleDNA-Firmware\\\\Friction-Tester\" && arduino-cli compile --fqbn esp32:esp32:esp32s3 Friction-Tester.ino 2>&1)"
+      "Bash(cd \"C:\\\\Users\\\\steve\\\\Documents\\\\PaddleDNA\\\\PaddleDNA-Firmware\\\\Friction-Tester\" && arduino-cli compile --fqbn esp32:esp32:esp32s3 Friction-Tester.ino 2>&1)",
+      "Bash(arduino-cli compile *)"
     ],
     "deny": [],
     "ask": []
