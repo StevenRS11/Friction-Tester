@@ -195,6 +195,9 @@ int         g_uiCalStep       = 0;
 const char* g_uiCalLine1      = "";
 const char* g_uiCalLine2      = "";
 const char* g_uiCalFooter     = "";
+bool        g_uiCalShowLive   = false;
+long        g_uiCalLiveRaw    = 0;
+bool        g_uiCalLiveValid  = false;
 uint8_t     g_uiAnimFrame     = 0;
 uint32_t    g_uiLastDrawMs    = 0;
 
@@ -229,6 +232,9 @@ void   loadCalibration();
 long   nauReadRawAvg(int n);
 float  rawToPounds(long raw);
 void   doCalibration3lb();
+void   calLivePoll();
+void   calWaitForButtonPress(bool& shortPress, bool& longPress);
+void   calWaitForButtonRelease();
 void   homeToLimit();
 void   homeToLimitSafe();
 void   homeToLimitForce();
@@ -561,6 +567,19 @@ void ui_screenCalStep() {
     oled.print(g_uiCalLine2);
   }
 
+  if (g_uiCalShowLive) {
+    char liveBuf[24];
+    if (g_uiCalLiveValid) {
+      long delta = g_uiCalLiveRaw - g_tareRaw;
+      float lbs = (g_calibration != 0.0f) ? (float)delta / g_calibration : 0.0f;
+      snprintf(liveBuf, sizeof(liveBuf), "%+.3f lb (%ld)", lbs, delta);
+    } else {
+      snprintf(liveBuf, sizeof(liveBuf), "---");
+    }
+    oled.setCursor(ui_centerX(liveBuf, 1), 44);
+    oled.print(liveBuf);
+  }
+
   ui_drawFooter(g_uiCalFooter);
   oled.display();
 }
@@ -641,6 +660,47 @@ float rawToPounds(long raw) {
   return (float)(raw - g_tareRaw) / g_calibration;
 }
 
+// Drains any pending NAU7802 samples without blocking, keeping the live
+// reading current. Safe to call from cal flow since g_collectSamples is false
+// (forceSamplingTask is idle).
+void calLivePoll() {
+  while (nau.available()) {
+    g_uiCalLiveRaw = nau.getReading();
+    g_uiCalLiveValid = true;
+  }
+}
+
+// Wait for START press while showing a live load reading on the OLED.
+void calWaitForButtonPress(bool& shortPress, bool& longPress) {
+  shortPress = false;
+  longPress  = false;
+  uint32_t lastDraw = 0;
+  while (!shortPress && !longPress) {
+    readButton(btnStart, shortPress, longPress);
+    calLivePoll();
+    uint32_t now = millis();
+    if (now - lastDraw >= 100) {
+      lastDraw = now;
+      ui_screenCalStep();
+    }
+    delay(2);
+  }
+}
+
+// Wait for START release (used at boot) while showing live load reading.
+void calWaitForButtonRelease() {
+  uint32_t lastDraw = 0;
+  while (digitalRead(BTN_START) == LOW) {
+    calLivePoll();
+    uint32_t now = millis();
+    if (now - lastDraw >= 100) {
+      lastDraw = now;
+      ui_screenCalStep();
+    }
+    delay(2);
+  }
+}
+
 void doCalibration3lb() {
   g_abortRequested = false;
   g_abortBtnDownAt = 0;
@@ -679,14 +739,13 @@ void doCalibration3lb() {
   g_uiCalLine1  = "Remove all load";
   g_uiCalLine2  = "from sled";
   g_uiCalFooter = "Tap to tare";
+  g_uiCalShowLive = true;
   ui_screenCalStep();
 
   bool sp = false, lp = false;
-  while (!sp && !lp) {
-    readButton(btnStart, sp, lp);
-    delay(10);
-  }
+  calWaitForButtonPress(sp, lp);
 
+  g_uiCalShowLive = false;
   g_uiCalLine1  = "Taring...";
   g_uiCalLine2  = "Hold still";
   g_uiCalFooter = "";
@@ -705,15 +764,12 @@ void doCalibration3lb() {
   g_uiCalLine1  = placeLine;
   g_uiCalLine2  = "weight on sled";
   g_uiCalFooter = "Tap to sample";
+  g_uiCalShowLive = true;
   ui_screenCalStep();
 
-  sp = false;
-  lp = false;
-  while (!sp && !lp) {
-    readButton(btnStart, sp, lp);
-    delay(10);
-  }
+  calWaitForButtonPress(sp, lp);
 
+  g_uiCalShowLive = false;
   g_uiCalLine1  = "Sampling...";
   g_uiCalLine2  = "Hold still";
   g_uiCalFooter = "";
@@ -788,6 +844,7 @@ cal_abort:
   {
     Serial.println("CALIBRATION ABORTED");
     g_collectSamples = false;
+    g_uiCalShowLive = false;
     g_abortRequested = false;
     g_abortBtnDownAt = 0;
     ui_screenAborted("Cal cancelled");
@@ -1620,9 +1677,11 @@ void setup() {
     g_uiCalLine1  = "Release button";
     g_uiCalLine2  = "to begin calibration";
     g_uiCalFooter = "";
+    g_uiCalShowLive = true;
     g_uiPhase = UI_CAL;
     ui_screenCalStep();
-    while (digitalRead(BTN_START) == LOW) delay(10);
+    calWaitForButtonRelease();
+    g_uiCalShowLive = false;
     delay(200);
     doCalibration3lb();
   }
